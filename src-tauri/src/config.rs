@@ -5,9 +5,12 @@ use tauri::Manager;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
+    #[serde(default)]
     pub last_collection: Option<String>,
+    #[serde(default = "default_zotero_dir")]
     pub zotero_data_dir: String,
     /// LiteLLM chat model string, e.g. "gpt-4o" or "ollama/llama3.1".
+    #[serde(default = "default_model")]
     pub model: String,
     /// LiteLLM embedding model, e.g. "text-embedding-3-small" or
     /// "ollama/nomic-embed-text". The index cache is keyed by this — changing
@@ -39,6 +42,10 @@ fn default_embedding() -> String {
     "text-embedding-3-small".to_string()
 }
 
+fn default_model() -> String {
+    "gpt-4o".to_string()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -55,18 +62,45 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Load config from the app config dir. Returns defaults if the file is
-    /// missing, unreadable, or malformed (never errors).
+    /// Load config from the app config dir. On first run (no user config), seed
+    /// from a bundled `team_config.json` so team members get a working setup
+    /// (shared model/gateway/keys) with ZERO configuration. Never errors.
     pub fn load(app: &tauri::AppHandle) -> Config {
-        let path = match config_path(app) {
-            Ok(p) => p,
-            Err(_) => return Config::default(),
-        };
-        let raw = match fs::read_to_string(&path) {
-            Ok(r) => r,
-            Err(_) => return Config::default(),
-        };
-        serde_json::from_str(&raw).unwrap_or_else(|_| Config::default())
+        if let Ok(path) = config_path(app) {
+            if let Ok(raw) = fs::read_to_string(&path) {
+                if let Ok(cfg) = serde_json::from_str::<Config>(&raw) {
+                    return cfg;
+                }
+            }
+        }
+        // First run: seed from bundled team defaults, then persist so the team
+        // key isn't re-read from the bundle on every launch.
+        if let Some(cfg) = Self::bundled_team_config(app) {
+            let _ = cfg.save(app);
+            return cfg;
+        }
+        Config::default()
+    }
+
+    /// Read team defaults from `team_config.json` if shipped with the app.
+    /// Checked in the bundled resource dir (release) and next to the binary /
+    /// project (dev). Missing/blank fields fall back to per-field defaults.
+    fn bundled_team_config(app: &tauri::AppHandle) -> Option<Config> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Ok(dir) = app.path().resource_dir() {
+            candidates.push(dir.join("team_config.json"));
+        }
+        // Dev fallbacks (cwd is usually src-tauri under `tauri dev`).
+        candidates.push(PathBuf::from("team_config.json"));
+        candidates.push(PathBuf::from("src-tauri/team_config.json"));
+        for p in candidates {
+            if let Ok(raw) = fs::read_to_string(&p) {
+                if let Ok(cfg) = serde_json::from_str::<Config>(&raw) {
+                    return Some(cfg);
+                }
+            }
+        }
+        None
     }
 
     /// Persist config as JSON to the app config dir, creating it if needed.

@@ -1,0 +1,8 @@
+{
+  "model": "openai/gpt-oss-120b",
+  "embedding": "openai/nomic-embed-text-v1.5",
+  "api_base": "https://api.ai.it.ufl.edu/v1",
+  "api_key": "PASTE_TEAM_NAVIGATOR_KEY_HERE",
+  "qdrant_url": "https://YOUR-CLUSTER.us-east-2-0.aws.cloud.qdrant.io",
+  "qdrant_api_key": "PASTE_QDRANT_API_KEY_HERE"
+}

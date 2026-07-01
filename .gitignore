@@ -21,3 +21,6 @@ config.local.json
 
 # Harness-local settings (may contain command logs with secrets)
 /.claude
+
+# Team defaults with real keys — bundled into the .app, never committed
+/src-tauri/team_config.json
