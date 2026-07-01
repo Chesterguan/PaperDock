@@ -1,0 +1,30 @@
+[package]
+name = "paperdock"
+version = "0.1.0"
+description = "PaperDock — ask your Zotero collection, get cited answers."
+authors = ["PaperDock"]
+edition = "2021"
+rust-version = "1.77"
+
+[lib]
+name = "paperdock_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "paperdock"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["process", "io-util", "macros", "rt", "sync"] }
+futures = "0.3"
+dirs = "5"
+# Pin: cookie 0.18.1 (via tauri/wry) breaks against time >= 0.3.52 (Parsable::parse
+# signature change). Hold time at 0.3.51 until tauri's cookie dep updates.
+time = "=0.3.51"

@@ -1,0 +1,12 @@
+[build]
+target = "index.html"
+
+[serve]
+port = 1420
+address = "127.0.0.1"
+
+# Only the frontend lives in src/, styles.css, index.html. Ignore everything
+# else so harness/tooling writes (e.g. .claude/settings.local.json) don't
+# trigger a WASM rebuild + webview reload mid-session.
+[watch]
+ignore = [".claude", "sidecar", "src-tauri", "docs", "dist", "target"]

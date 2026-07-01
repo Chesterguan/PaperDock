@@ -1,0 +1,23 @@
+# Rust / Tauri
+/target
+/src-tauri/target
+
+# Frontend build output
+/dist
+
+# Python sidecar venv (rebuild via: uv venv sidecar/.venv && uv pip install paper-qa pillow pypdf[image] qdrant-client)
+/sidecar/.venv
+__pycache__/
+*.pyc
+
+# Secrets — API keys live in the app config dir, never in the repo
+# (~/Library/Application Support/com.paperdock.app/config.json)
+*.env
+.env
+config.local.json
+
+# macOS
+.DS_Store
+
+# Harness-local settings (may contain command logs with secrets)
+/.claude

@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core permissions for the PaperDock main window. Event listen is required for the backend's streamed `answer` events to reach the UI.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}
