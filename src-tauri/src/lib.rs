@@ -1,0 +1,361 @@
+mod config;
+mod sidecar;
+mod zotero;
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
+
+use tauri::{Emitter, Manager, State};
+
+use config::Config;
+use sidecar::{AnswerEvent, ChildSlot};
+use zotero::{Collection, DocRef};
+
+/// Shared application state managed by Tauri.
+pub struct AppState {
+    /// Persisted user config (last collection, data dir, model).
+    pub config: Mutex<Config>,
+    /// Handle to the currently running worker child, so `cancel` can kill it.
+    pub child: ChildSlot,
+    /// Absolute path to the Python sidecar worker, resolved at startup.
+    pub worker_path: String,
+}
+
+/// Monotonic counter used to tag each ask request with a unique id.
+static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+// ----- Tauri commands ------------------------------------------------------
+
+/// True when the local Zotero HTTP API is reachable.
+#[tauri::command]
+async fn zotero_status() -> bool {
+    zotero::is_running().await
+}
+
+/// List the user's Zotero collections.
+#[tauri::command]
+async fn list_collections() -> Result<Vec<Collection>, String> {
+    zotero::list_collections().await
+}
+
+/// Resolve the collection's PDFs and spawn a streaming answer task.
+///
+/// Returns immediately; the answer arrives as `"answer"` events. If the
+/// collection has no resolvable PDFs, an error event is emitted instead.
+#[tauri::command]
+async fn ask(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    library: String,
+    collection_key: String,
+    question: String,
+) -> Result<(), String> {
+    spawn_worker(app, state, "ask", library, collection_key, question).await
+}
+
+/// Pre-embed a collection into the shared index (no LLM query), so later asks
+/// are instant and the group's shared vectors stay complete.
+#[tauri::command]
+async fn index_collection(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    library: String,
+    collection_key: String,
+) -> Result<(), String> {
+    spawn_worker(app, state, "index", library, collection_key, String::new()).await
+}
+
+/// Shared path for ask + index: resolve the collection's PDFs and spawn the
+/// worker with the given command. Returns immediately; progress/results arrive
+/// as `"answer"` events.
+async fn spawn_worker(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    cmd: &'static str,
+    library: String,
+    collection_key: String,
+    question: String,
+) -> Result<(), String> {
+    // Snapshot the config values we need without holding the lock across await.
+    let (model, embedding, api_base, data_dir, api_key, qdrant_url, qdrant_key) = {
+        let cfg = state
+            .config
+            .lock()
+            .map_err(|_| "Config is unavailable.".to_string())?;
+        (
+            cfg.model.clone(),
+            cfg.embedding.clone(),
+            cfg.api_base.clone().unwrap_or_default(),
+            cfg.zotero_data_dir.clone(),
+            cfg.api_key.clone().unwrap_or_default(),
+            cfg.qdrant_url.clone().unwrap_or_default(),
+            cfg.qdrant_api_key.clone().unwrap_or_default(),
+        )
+    };
+
+    let docs: Vec<DocRef> = zotero::collection_docs(&library, &collection_key, &data_dir).await?;
+
+    // Scope the shared Qdrant index per library+collection so group and
+    // personal collections with the same key never collide.
+    let scope = format!("{}_{}", library.replace('/', "_"), collection_key);
+
+    if docs.is_empty() {
+        let _ = app.emit(
+            "answer",
+            AnswerEvent::Error {
+                message: "No PDFs found in this collection.".to_string(),
+            },
+        );
+        return Ok(());
+    }
+
+    let n = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let request_id = format!("q{n}");
+
+    let cache_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("Could not resolve cache directory: {e}"))?
+        .join("paperqa_index")
+        .to_string_lossy()
+        .into_owned();
+
+    let worker_path = state.worker_path.clone();
+    let child_slot = state.child.clone();
+    let app_handle = app.clone();
+
+    tauri::async_runtime::spawn(async move {
+        if let Err(message) = sidecar::run_ask(
+            app_handle.clone(),
+            worker_path,
+            cmd,
+            request_id,
+            question,
+            model,
+            embedding,
+            api_base,
+            cache_dir,
+            api_key,
+            qdrant_url,
+            qdrant_key,
+            scope,
+            docs,
+            child_slot,
+        )
+        .await
+        {
+            let _ = app_handle.emit("answer", AnswerEvent::Error { message });
+        }
+    });
+
+    Ok(())
+}
+
+/// Kill the running worker, if any.
+#[tauri::command]
+async fn cancel(state: State<'_, AppState>) -> Result<(), String> {
+    sidecar::cancel(state.child.clone()).await;
+    Ok(())
+}
+
+/// Open the given item in the Zotero desktop app via `zotero://select`.
+/// `library` is "users/0" (My Library) or "groups/<id>" — group items need the
+/// group path in the URI or Zotero selects the wrong/no item.
+#[tauri::command]
+fn open_in_zotero(library: String, item_key: String) -> Result<(), String> {
+    let uri = if library.starts_with("groups/") {
+        format!("zotero://select/{library}/items/{item_key}")
+    } else {
+        format!("zotero://select/library/items/{item_key}")
+    };
+    std::process::Command::new("open")
+        .arg(uri)
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| "Could not open Zotero.".to_string())
+}
+
+/// Frontend-safe view of config — never includes the raw API key.
+#[derive(serde::Serialize)]
+struct UiConfig {
+    last_collection: Option<String>,
+    model: String,
+    embedding: String,
+    api_base: String,
+    qdrant_url: String,
+    has_qdrant_key: bool,
+    /// True if a usable key exists (env var or saved), so the UI can hide the
+    /// key prompt.
+    has_api_key: bool,
+}
+
+/// Open an external URL in the default browser (used for the PaperQA credit).
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    // Only allow http(s) so a crafted URL can't run `open` on something local.
+    if !(url.starts_with("https://") || url.starts_with("http://")) {
+        return Err("Refusing to open a non-web URL.".to_string());
+    }
+    std::process::Command::new("open")
+        .arg(url)
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| "Could not open the link.".to_string())
+}
+
+/// Return the frontend-safe config (no secrets).
+#[tauri::command]
+fn get_config(state: State<'_, AppState>) -> UiConfig {
+    let cfg = state.config.lock().map(|c| c.clone()).unwrap_or_default();
+    let has_saved = cfg.api_key.as_deref().is_some_and(|k| !k.trim().is_empty());
+    let has_env = std::env::var("OPENAI_API_KEY").is_ok();
+    UiConfig {
+        last_collection: cfg.last_collection,
+        model: cfg.model,
+        embedding: cfg.embedding,
+        api_base: cfg.api_base.unwrap_or_default(),
+        qdrant_url: cfg.qdrant_url.unwrap_or_default(),
+        has_qdrant_key: cfg
+            .qdrant_api_key
+            .as_deref()
+            .is_some_and(|k| !k.trim().is_empty()),
+        has_api_key: has_saved || has_env,
+    }
+}
+
+/// Save the LiteLLM API key entered in the UI (empty string clears it).
+#[tauri::command]
+fn set_api_key(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    key: String,
+) -> Result<(), String> {
+    let trimmed = key.trim().to_string();
+    let cfg = {
+        let mut guard = state
+            .config
+            .lock()
+            .map_err(|_| "Config is unavailable.".to_string())?;
+        guard.api_key = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
+        guard.clone()
+    };
+    cfg.save(&app)
+}
+
+/// Save model / embedding / base-url settings (empty base = provider default).
+#[tauri::command]
+fn set_settings(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    model: String,
+    embedding: String,
+    api_base: String,
+    qdrant_url: String,
+    qdrant_key: String,
+) -> Result<(), String> {
+    let cfg = {
+        let mut guard = state
+            .config
+            .lock()
+            .map_err(|_| "Config is unavailable.".to_string())?;
+        let m = model.trim();
+        let e = embedding.trim();
+        if !m.is_empty() {
+            guard.model = m.to_string();
+        }
+        if !e.is_empty() {
+            guard.embedding = e.to_string();
+        }
+        let opt = |s: &str| {
+            let t = s.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        };
+        guard.api_base = opt(&api_base);
+        guard.qdrant_url = opt(&qdrant_url);
+        // Blank key field leaves the saved key untouched (so you don't have to
+        // re-paste it every time); to clear it, blank the URL too.
+        if let Some(k) = opt(&qdrant_key) {
+            guard.qdrant_api_key = Some(k);
+        }
+        if guard.qdrant_url.is_none() {
+            guard.qdrant_api_key = None;
+        }
+        guard.clone()
+    };
+    cfg.save(&app)
+}
+
+/// Remember the last selected collection and persist config.
+#[tauri::command]
+fn set_last_collection(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    key: String,
+) -> Result<(), String> {
+    let cfg = {
+        let mut guard = state
+            .config
+            .lock()
+            .map_err(|_| "Config is unavailable.".to_string())?;
+        guard.last_collection = Some(key);
+        guard.clone()
+    };
+    cfg.save(&app)
+}
+
+// ----- Setup helpers -------------------------------------------------------
+
+/// Resolve the sidecar worker path, trying dev-relative locations first, then
+/// the bundled resource directory.
+fn resolve_worker_path(app: &tauri::AppHandle) -> String {
+    let mut candidates: Vec<PathBuf> = vec![
+        PathBuf::from("../sidecar/paperdock_worker.py"),
+        PathBuf::from("sidecar/paperdock_worker.py"),
+    ];
+    if let Ok(res_dir) = app.path().resource_dir() {
+        candidates.push(res_dir.join("paperdock_worker.py"));
+    }
+    for candidate in &candidates {
+        if candidate.exists() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
+    candidates[0].to_string_lossy().into_owned()
+}
+
+/// Build, configure, and run the Tauri application.
+pub fn run() {
+    tauri::Builder::default()
+        .setup(|app| {
+            let handle = app.handle();
+            let worker_path = resolve_worker_path(handle);
+            let cfg = Config::load(handle);
+            app.manage(AppState {
+                config: Mutex::new(cfg),
+                child: Arc::new(tokio::sync::Mutex::new(None)),
+                worker_path,
+            });
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            zotero_status,
+            list_collections,
+            ask,
+            index_collection,
+            cancel,
+            open_in_zotero,
+            open_url,
+            get_config,
+            set_last_collection,
+            set_api_key,
+            set_settings,
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running PaperDock");
+}
