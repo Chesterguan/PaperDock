@@ -1,6 +1,6 @@
 [package]
 name = "paperdock-ui"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "PaperDock v1 Leptos CSR frontend"
 

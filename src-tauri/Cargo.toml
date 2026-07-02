@@ -1,6 +1,6 @@
 [package]
 name = "paperdock"
-version = "0.1.0"
+version = "0.2.0"
 description = "PaperDock — ask your Zotero collection, get cited answers."
 authors = ["PaperDock"]
 edition = "2021"
