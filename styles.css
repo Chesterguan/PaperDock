@@ -491,3 +491,80 @@ input.ask:disabled {
   opacity: 1;
   text-decoration: underline;
 }
+
+/* ---- brand / logo ---- */
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.logo {
+  width: 22px;
+  height: 22px;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+
+.logo .dock {
+  stroke: var(--accent);
+  opacity: 0.55;
+}
+
+.wordmark {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+
+/* ---- conversation thread (earlier turns) ---- */
+.turn-q {
+  font-family: var(--sans);
+  font-size: 16px;
+  font-weight: 500;
+  color: var(--text);
+  margin-bottom: 4px;
+}
+
+.thread {
+  display: flex;
+  flex-direction: column;
+  gap: 30px;
+}
+
+.thread:empty {
+  display: none;
+}
+
+.turn {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 26px;
+  border-top: 1px solid var(--border);
+}
+
+.turn-a {
+  font-family: var(--mono);
+  font-size: 13.5px;
+  line-height: 1.75;
+  color: var(--text-dim);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.turn-src {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+
+.srclabel {
+  font-size: 10px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--text-faint);
+  margin-right: 3px;
+}

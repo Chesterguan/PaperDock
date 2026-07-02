@@ -92,6 +92,15 @@ struct Passage {
     snippet: String,
 }
 
+/// One completed Q&A in the conversation thread.
+#[derive(Clone)]
+struct Turn {
+    id: usize,
+    question: String,
+    answer: String,
+    refs: Vec<RefItem>,
+}
+
 /// Flattened `AnswerEvent` (serde tag = "kind", rename_all = "lowercase").
 #[derive(Deserialize)]
 struct AnswerEvent {
@@ -121,6 +130,11 @@ fn App() -> impl IntoView {
     let refs = RwSignal::new(Vec::<RefItem>::new());
     let active_source = RwSignal::new(0usize); // which Sources tab is open
     let streaming = RwSignal::new(false);
+    // Conversation thread: `asked` is the current in-progress question; `history`
+    // holds completed turns above it.
+    let asked = RwSignal::new(String::new());
+    let history = RwSignal::new(Vec::<Turn>::new());
+    let turn_id = RwSignal::new(0usize);
     let has_key = RwSignal::new(true); // assume present until startup says otherwise
     let key_input = RwSignal::new(String::new());
     // Settings panel (model / embedding / base URL / key).
@@ -260,6 +274,11 @@ fn App() -> impl IntoView {
     let on_collection_change = move |ev: web_sys::Event| {
         let k = event_target_value(&ev);
         selected.set(k.clone());
+        // New collection = new conversation.
+        history.set(Vec::new());
+        asked.set(String::new());
+        answer.set(String::new());
+        refs.set(Vec::new());
         spawn_local(async move {
             let _ = invoke("set_last_collection", args(serde_json::json!({ "key": k }))).await;
         });
@@ -276,8 +295,25 @@ fn App() -> impl IntoView {
         // id is "<library>::<collectionKey>".
         let (library, key) = id.split_once("::").unwrap_or(("users/0", id.as_str()));
         let (library, key) = (library.to_string(), key.to_string());
+        // Archive the previous completed answer into the thread.
+        let prev = answer.get();
+        if !prev.is_empty() {
+            let n = turn_id.get();
+            turn_id.set(n + 1);
+            history.update(|h| {
+                h.push(Turn {
+                    id: n,
+                    question: asked.get(),
+                    answer: prev,
+                    refs: refs.get(),
+                })
+            });
+        }
+        asked.set(q.clone());
+        question.set(String::new()); // clear input, ready for the next question
         answer.set(String::new());
         refs.set(Vec::new());
+        active_source.set(0);
         streaming.set(true);
         status.set("Indexing…".to_string());
         spawn_local(async move {
@@ -349,10 +385,23 @@ fn App() -> impl IntoView {
     view! {
         <main class="app">
             <header class="topbar">
-                <span class="brand">"PaperDock"</span>
+                <div class="brand">
+                    <svg class="logo" viewBox="0 0 24 24" fill="none"
+                        stroke="currentColor" stroke-width="1.8"
+                        stroke-linecap="round" stroke-linejoin="round">
+                        // a paper sheet with a folded corner, "docked" on an
+                        // accent underline — paper + dock.
+                        <path d="M7 3h6l4 4v11H7z"/>
+                        <path d="M13 3v4h4"/>
+                        <line x1="10" y1="11" x2="14" y2="11"/>
+                        <line x1="10" y1="14" x2="13" y2="14"/>
+                        <line class="dock" x1="5" y1="21" x2="19" y2="21"/>
+                    </svg>
+                    <span class="wordmark">"PaperDock"</span>
+                </div>
                 <button
                     class="gear"
-                    title="Settings"
+                    title="Settings — model, gateway, API key, shared vector DB"
                     on:click=move |_| show_settings.update(|s| *s = !*s)
                 >
                     "⚙"
@@ -391,10 +440,12 @@ fn App() -> impl IntoView {
 
             <div class="field">
                 <span class="labelrow">
-                    <span class="label">"Collection"</span>
+                    <span class="label" title="Pick a Zotero collection or a whole library to ask about">
+                        "Collection"
+                    </span>
                     <button
                         class="idxbtn"
-                        title="Pre-embed every paper in this collection into the shared index"
+                        title="Read all papers into the shared index now, so later questions answer instantly. Runs in the background."
                         prop:disabled=move || streaming.get()
                         on:click=move |_| index()
                     >
@@ -403,6 +454,7 @@ fn App() -> impl IntoView {
                 </span>
                 <select
                     class="collection"
+                    title="Your Zotero libraries and collections. Group libraries are shared with your team."
                     prop:value=move || selected.get()
                     on:change=on_collection_change
                 >
@@ -446,6 +498,10 @@ fn App() -> impl IntoView {
                     <button class="stop" title="Stop" on:click=move |_| cancel()>"Stop"</button>
                 })}
             </div>
+
+            // Current question (shown above its streaming answer).
+            {move || (!asked.get().is_empty())
+                .then(|| view! { <div class="turn-q">{asked.get()}</div> })}
 
             <div class="answer">
                 // While waiting (no tokens yet) show a spinner next to the live
@@ -494,6 +550,7 @@ fn App() -> impl IntoView {
                                 view! {
                                     <button
                                         class="tab"
+                                        title="Show the passages from this paper that support the answer"
                                         class:active=move || active_source.get() == i
                                         on:click=move |_| active_source.set(i)
                                     >
@@ -548,6 +605,59 @@ fn App() -> impl IntoView {
                         }}
                     }.into_any()
                 }}
+            </div>
+
+            // Conversation history — earlier turns, newest first, below the
+            // current answer.
+            <div class="thread">
+                <For
+                    each=move || { let mut v = history.get(); v.reverse(); v }
+                    key=|t| t.id
+                    let:t
+                >
+                    {
+                        let refs_t = t.refs.clone();
+                        view! {
+                            <div class="turn">
+                                <div class="turn-q">{t.question.clone()}</div>
+                                <div class="turn-a">{t.answer.clone()}</div>
+                                {(!refs_t.is_empty()).then(|| view! {
+                                    <div class="turn-src">
+                                        <span class="srclabel">"Sources"</span>
+                                        {refs_t.into_iter().map(|r| {
+                                            let item_key = r.item_key.clone();
+                                            view! {
+                                                <button
+                                                    class="chip"
+                                                    title="Open this paper in Zotero"
+                                                    on:click=move |_| {
+                                                        let item_key = item_key.clone();
+                                                        let library = selected
+                                                            .get()
+                                                            .split_once("::")
+                                                            .map(|(l, _)| l.to_string())
+                                                            .unwrap_or_else(|| "users/0".to_string());
+                                                        spawn_local(async move {
+                                                            let _ = invoke(
+                                                                "open_in_zotero",
+                                                                args(serde_json::json!({
+                                                                    "library": library,
+                                                                    "itemKey": item_key,
+                                                                })),
+                                                            ).await;
+                                                        });
+                                                    }
+                                                >
+                                                    {r.citation.clone()}
+                                                </button>
+                                            }
+                                        }).collect_view()}
+                                    </div>
+                                })}
+                            </div>
+                        }
+                    }
+                </For>
             </div>
 
             <footer class="credit">
