@@ -21,6 +21,14 @@ pub enum AnswerEvent {
 pub struct RefItem {
     pub item_key: String,
     pub citation: String,
+    #[serde(default)]
+    pub passages: Vec<Passage>,
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct Passage {
+    pub page: String,
+    pub snippet: String,
 }
 
 pub type ChildSlot = Arc<Mutex<Option<Child>>>;
@@ -259,6 +267,26 @@ fn parse_event(raw: &str) -> Option<AnswerEvent> {
                                 .and_then(Value::as_str)
                                 .unwrap_or_default()
                                 .to_string(),
+                            passages: it
+                                .get("passages")
+                                .and_then(Value::as_array)
+                                .map(|ps| {
+                                    ps.iter()
+                                        .map(|p| Passage {
+                                            page: p
+                                                .get("page")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or_default()
+                                                .to_string(),
+                                            snippet: p
+                                                .get("snippet")
+                                                .and_then(Value::as_str)
+                                                .unwrap_or_default()
+                                                .to_string(),
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
                         })
                         .collect()
                 })

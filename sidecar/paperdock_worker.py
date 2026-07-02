@@ -257,18 +257,44 @@ async def answer_real(req):
         send({"id": qid, "type": "token", "text": word + " "})
         time.sleep(0.01)  # cosmetic: makes the answer visibly stream in
 
-    used = session.get_unique_docs_from_contexts(score_threshold=1)
-    if not used:
-        used = session.get_unique_docs_from_contexts()
-    items, seen = [], set()
-    for doc in used:
-        key = getattr(doc, "dockey", None)
-        if not key or key in seen:
-            continue
-        seen.add(key)
-        items.append({"zotero_key": key,
-                      "citation": getattr(doc, "citation", None) or key})
-    send({"id": qid, "type": "references", "items": items})
+    # Build references (with cited passages). Best-effort: the answer already
+    # streamed, so a hiccup here must NEVER sink the whole response.
+    try:
+        used = session.get_unique_docs_from_contexts(score_threshold=1)
+        if not used:
+            used = session.get_unique_docs_from_contexts()
+
+        # Cited passages per doc (raw text + page + score) so the UI shows the
+        # evidence, not just a citation. Free from session.contexts.
+        from collections import defaultdict
+        by_key = defaultdict(list)
+        for ctx in session.contexts:
+            text = getattr(ctx, "text", None)
+            k = getattr(getattr(text, "doc", None), "dockey", None)
+            if not text or not k:
+                continue
+            name = getattr(text, "name", None) or ""
+            page = name.split(" pages ", 1)[1].strip() if " pages " in name else ""
+            by_key[k].append({
+                "page": page,
+                "snippet": " ".join((getattr(text, "text", None) or "").split())[:300],
+                "score": getattr(ctx, "score", 0) or 0,
+            })
+
+        items, seen = [], set()
+        for doc in used:
+            key = getattr(doc, "dockey", None)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            passages = sorted(by_key.get(key, []), key=lambda p: -p["score"])[:3]
+            items.append({"zotero_key": key,
+                          "citation": getattr(doc, "citation", None) or key,
+                          "passages": passages})
+        send({"id": qid, "type": "references", "items": items})
+    except Exception as exc:
+        sys.stderr.write("references build failed (answer already sent): %r\n" % exc)
+
     send({"id": qid, "type": "done"})
 
 

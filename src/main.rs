@@ -80,6 +80,16 @@ struct Config {
 struct RefItem {
     item_key: String,
     citation: String,
+    #[serde(default)]
+    passages: Vec<Passage>,
+}
+
+#[derive(Clone, Deserialize)]
+struct Passage {
+    #[serde(default)]
+    page: String,
+    #[serde(default)]
+    snippet: String,
 }
 
 /// Flattened `AnswerEvent` (serde tag = "kind", rename_all = "lowercase").
@@ -478,30 +488,41 @@ fn App() -> impl IntoView {
                 >
                     {
                         let item_key = r.item_key.clone();
+                        let passages = r.passages.clone();
                         view! {
-                            <button
-                                class="chip"
-                                on:click=move |_| {
-                                    let item_key = item_key.clone();
-                                    // Refs belong to the selected collection's library;
-                                    // group items need the group path in the URI.
-                                    let library = selected
-                                        .get()
-                                        .split_once("::")
-                                        .map(|(l, _)| l.to_string())
-                                        .unwrap_or_else(|| "users/0".to_string());
-                                    spawn_local(async move {
-                                        let _ = invoke(
-                                            "open_in_zotero",
-                                            args(serde_json::json!({
-                                                "library": library, "itemKey": item_key,
-                                            })),
-                                        ).await;
-                                    });
-                                }
-                            >
-                                {r.citation.clone()}
-                            </button>
+                            <div class="source">
+                                <button
+                                    class="chip"
+                                    on:click=move |_| {
+                                        let item_key = item_key.clone();
+                                        // Refs belong to the selected collection's
+                                        // library; group items need the group path.
+                                        let library = selected
+                                            .get()
+                                            .split_once("::")
+                                            .map(|(l, _)| l.to_string())
+                                            .unwrap_or_else(|| "users/0".to_string());
+                                        spawn_local(async move {
+                                            let _ = invoke(
+                                                "open_in_zotero",
+                                                args(serde_json::json!({
+                                                    "library": library, "itemKey": item_key,
+                                                })),
+                                            ).await;
+                                        });
+                                    }
+                                >
+                                    {r.citation.clone()}
+                                </button>
+                                {passages.into_iter().map(|p| view! {
+                                    <div class="passage">
+                                        {(!p.page.is_empty()).then(|| view! {
+                                            <span class="pageno">{format!("p. {}", p.page)}</span>
+                                        })}
+                                        <span class="quote">{format!("“{}”", p.snippet)}</span>
+                                    </div>
+                                }).collect_view()}
+                            </div>
                         }
                     }
                 </For>

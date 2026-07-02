@@ -407,3 +407,34 @@ input.ask:disabled {
   opacity: 0.4;
   cursor: default;
 }
+
+.refs {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 14px;
+}
+
+.source {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.passage {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  padding-left: 11px;
+  border-left: 2px solid var(--accent-dim);
+}
+
+.pageno {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-faint);
+  margin-right: 7px;
+}
+
+.quote {
+  font-style: italic;
+}
