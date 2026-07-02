@@ -257,13 +257,40 @@ fn App() -> impl IntoView {
             let payload = js_sys::Reflect::get(&ev, &JsValue::from_str("payload"))
                 .unwrap_or(JsValue::NULL);
             let name = payload.as_string().unwrap_or_default();
-            needs_config.set(false);
-            has_key.set(true);
-            show_settings.set(false);
-            toast.set(if name.is_empty() {
+            let keyed_toast = if name.is_empty() {
                 "Lab config imported ✓".to_string()
             } else {
                 format!("Lab config imported ✓ ({name})")
+            };
+            // The shared config was applied either way, so the first-run gate
+            // is done — but whether the member still needs their own key
+            // depends on the real backend state, not a blind assumption. An
+            // admin can export without the LLM key (README tells members to
+            // add their own), so re-read `get_config` and set state from the
+            // fresh values, same as startup does.
+            spawn_local(async move {
+                needs_config.set(false);
+                if let Ok(v) = invoke("get_config", args(serde_json::json!({}))).await {
+                    if let Ok(cfg) = serde_wasm_bindgen::from_value::<Config>(v) {
+                        has_key.set(cfg.has_api_key);
+                        model_input.set(cfg.model);
+                        embedding_input.set(cfg.embedding);
+                        apibase_input.set(cfg.api_base);
+                        qdrant_url_input.set(cfg.qdrant_url);
+                        if cfg.has_api_key {
+                            show_settings.set(false);
+                            toast.set(keyed_toast);
+                        } else {
+                            // Keyless import: prompt the member to add their own key.
+                            show_settings.set(true);
+                            toast.set("Lab config imported ✓ — add your API key in Settings".to_string());
+                        }
+                        return;
+                    }
+                }
+                // get_config failed or didn't parse — fall back to the
+                // pre-verification toast rather than silently claiming success.
+                toast.set(keyed_toast);
             });
         });
         spawn_local(async move {
