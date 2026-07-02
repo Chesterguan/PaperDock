@@ -65,6 +65,21 @@ async fn ask(
     .await
 }
 
+/// Citation-check: judge whether the collection's papers support a claim.
+/// Reuses the whole embed/retrieve pipeline with a verdict prompt (worker
+/// swaps the answer prompt when `cmd == "check"`). `claim` rides the `question`
+/// slot; no conversation history.
+#[tauri::command]
+async fn check(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    library: String,
+    collection_key: String,
+    claim: String,
+) -> Result<(), String> {
+    spawn_worker(app, state, "check", library, collection_key, claim, String::new()).await
+}
+
 /// Pre-embed a collection into the shared index (no LLM query), so later asks
 /// are instant and the group's shared vectors stay complete.
 #[tauri::command]
@@ -488,6 +503,7 @@ pub fn run() {
             zotero_status,
             list_collections,
             ask,
+            check,
             index_collection,
             cancel,
             env_status,

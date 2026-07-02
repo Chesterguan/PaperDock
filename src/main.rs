@@ -139,6 +139,7 @@ fn App() -> impl IntoView {
     let refs = RwSignal::new(Vec::<RefItem>::new());
     let active_source = RwSignal::new(0usize); // which Sources tab is open
     let streaming = RwSignal::new(false);
+    let check_mode = RwSignal::new(false); // false = Ask, true = Check citation
     // Conversation thread: `asked` is the current in-progress question; `history`
     // holds completed turns above it.
     let asked = RwSignal::new(String::new());
@@ -471,15 +472,27 @@ fn App() -> impl IntoView {
         notice.set(String::new());
         streaming.set(true);
         status.set("Indexing…".to_string());
+        let checking = check_mode.get_untracked();
         spawn_local(async move {
-            let res = invoke(
-                "ask",
-                args(serde_json::json!({
-                    "library": library, "collectionKey": key, "question": q,
-                    "history": hist_text,
-                })),
-            )
-            .await;
+            let res = if checking {
+                // Citation-check: `q` is a claim; no conversation history.
+                invoke(
+                    "check",
+                    args(serde_json::json!({
+                        "library": library, "collectionKey": key, "claim": q,
+                    })),
+                )
+                .await
+            } else {
+                invoke(
+                    "ask",
+                    args(serde_json::json!({
+                        "library": library, "collectionKey": key, "question": q,
+                        "history": hist_text,
+                    })),
+                )
+                .await
+            };
             if let Err(e) = res {
                 streaming.set(false);
                 let msg = serde_wasm_bindgen::from_value::<String>(e)
@@ -745,11 +758,27 @@ fn App() -> impl IntoView {
                 }}
             </div>
 
+            <div class="modes">
+                <button
+                    class="mode" class:on=move || !check_mode.get()
+                    on:click=move |_| check_mode.set(false)
+                >"Ask"</button>
+                <button
+                    class="mode" class:on=move || check_mode.get()
+                    on:click=move |_| check_mode.set(true)
+                    title="Paste a claim and check whether these papers support it"
+                >"Check citation"</button>
+            </div>
+
             <div class="askrow">
                 <input
                     class="ask"
                     type="text"
-                    placeholder="Ask your library."
+                    placeholder=move || if check_mode.get() {
+                        "Paste a claim to fact-check against these papers…"
+                    } else {
+                        "Ask your library."
+                    }
                     autofocus
                     prop:value=move || question.get()
                     prop:disabled=move || streaming.get()
