@@ -119,6 +119,7 @@ fn App() -> impl IntoView {
     let question = RwSignal::new(String::new());
     let answer = RwSignal::new(String::new());
     let refs = RwSignal::new(Vec::<RefItem>::new());
+    let active_source = RwSignal::new(0usize); // which Sources tab is open
     let streaming = RwSignal::new(false);
     let has_key = RwSignal::new(true); // assume present until startup says otherwise
     let key_input = RwSignal::new(String::new());
@@ -153,6 +154,7 @@ fn App() -> impl IntoView {
                 "references" => {
                     if let Some(items) = e.items {
                         refs.set(items);
+                        active_source.set(0);
                     }
                 }
                 "done" => {
@@ -477,55 +479,75 @@ fn App() -> impl IntoView {
             </div>
 
             <div class="refs">
+                // One tab per cited paper; the panel shows the active paper's
+                // evidence. Keeps sources compact instead of a long scroll.
                 {move || {
-                    (!refs.get().is_empty())
-                        .then(|| view! { <span class="refs-label">"Sources"</span> })
-                }}
-                <For
-                    each=move || refs.get()
-                    key=|r| r.item_key.clone()
-                    let:r
-                >
-                    {
-                        let item_key = r.item_key.clone();
-                        let passages = r.passages.clone();
-                        view! {
-                            <div class="source">
-                                <button
-                                    class="chip"
-                                    on:click=move |_| {
-                                        let item_key = item_key.clone();
-                                        // Refs belong to the selected collection's
-                                        // library; group items need the group path.
-                                        let library = selected
-                                            .get()
-                                            .split_once("::")
-                                            .map(|(l, _)| l.to_string())
-                                            .unwrap_or_else(|| "users/0".to_string());
-                                        spawn_local(async move {
-                                            let _ = invoke(
-                                                "open_in_zotero",
-                                                args(serde_json::json!({
-                                                    "library": library, "itemKey": item_key,
-                                                })),
-                                            ).await;
-                                        });
-                                    }
-                                >
-                                    {r.citation.clone()}
-                                </button>
-                                {passages.into_iter().map(|p| view! {
-                                    <div class="passage">
-                                        {(!p.page.is_empty()).then(|| view! {
-                                            <span class="pageno">{format!("p. {}", p.page)}</span>
-                                        })}
-                                        <span class="quote">{format!("“{}”", p.snippet)}</span>
-                                    </div>
-                                }).collect_view()}
-                            </div>
-                        }
+                    let items = refs.get();
+                    if items.is_empty() {
+                        return ().into_any();
                     }
-                </For>
+                    view! {
+                        <span class="refs-label">"Sources"</span>
+                        <div class="tabs">
+                            {items.iter().enumerate().map(|(i, r)| {
+                                let cit = r.citation.clone();
+                                view! {
+                                    <button
+                                        class="tab"
+                                        class:active=move || active_source.get() == i
+                                        on:click=move |_| active_source.set(i)
+                                    >
+                                        {cit}
+                                    </button>
+                                }
+                            }).collect_view()}
+                        </div>
+                        {move || {
+                            let items = refs.get();
+                            if items.is_empty() {
+                                return ().into_any();
+                            }
+                            let i = active_source.get().min(items.len() - 1);
+                            let r = items[i].clone();
+                            let item_key = r.item_key.clone();
+                            view! {
+                                <div class="tabpanel">
+                                    {r.passages.into_iter().map(|p| view! {
+                                        <div class="passage">
+                                            {(!p.page.is_empty()).then(|| view! {
+                                                <span class="pageno">
+                                                    {format!("p. {}", p.page)}
+                                                </span>
+                                            })}
+                                            <span class="quote">{p.snippet}</span>
+                                        </div>
+                                    }).collect_view()}
+                                    <button
+                                        class="openz"
+                                        on:click=move |_| {
+                                            let item_key = item_key.clone();
+                                            let library = selected
+                                                .get()
+                                                .split_once("::")
+                                                .map(|(l, _)| l.to_string())
+                                                .unwrap_or_else(|| "users/0".to_string());
+                                            spawn_local(async move {
+                                                let _ = invoke(
+                                                    "open_in_zotero",
+                                                    args(serde_json::json!({
+                                                        "library": library, "itemKey": item_key,
+                                                    })),
+                                                ).await;
+                                            });
+                                        }
+                                    >
+                                        "Open in Zotero →"
+                                    </button>
+                                </div>
+                            }.into_any()
+                        }}
+                    }.into_any()
+                }}
             </div>
 
             <footer class="credit">

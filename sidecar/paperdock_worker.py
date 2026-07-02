@@ -275,9 +275,18 @@ async def answer_real(req):
                 continue
             name = getattr(text, "name", None) or ""
             page = name.split(" pages ", 1)[1].strip() if " pages " in name else ""
+            # Prefer PaperQA's evidence summary (clean, complete, question-
+            # relevant). Fall back to a cleaned raw excerpt (local models that
+            # skip the summary), wrapped in ellipses to read as an excerpt.
+            summary = " ".join((getattr(ctx, "context", None) or "").split())
+            if summary:
+                snippet = summary[:700]
+            else:
+                raw = " ".join((getattr(text, "text", None) or "").split())
+                snippet = ("…" + raw[:300].strip() + "…") if raw else ""
             by_key[k].append({
                 "page": page,
-                "snippet": " ".join((getattr(text, "text", None) or "").split())[:300],
+                "snippet": snippet,
                 "score": getattr(ctx, "score", 0) or 0,
             })
 

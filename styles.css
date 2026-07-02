@@ -436,5 +436,58 @@ input.ask:disabled {
 }
 
 .quote {
-  font-style: italic;
+  color: var(--text-dim);
+}
+
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+.tab {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--text-faint);
+  border-radius: 6px;
+  padding: 4px 11px;
+  cursor: pointer;
+  transition: color var(--t), border-color var(--t), background var(--t);
+}
+
+.tab:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.tab.active {
+  color: var(--accent);
+  background: var(--accent-dim);
+  border-color: var(--accent);
+}
+
+.tabpanel {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.openz {
+  align-self: flex-start;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--accent);
+  background: transparent;
+  border: none;
+  padding: 2px 0;
+  cursor: pointer;
+  opacity: 0.85;
+}
+
+.openz:hover {
+  opacity: 1;
+  text-decoration: underline;
 }
