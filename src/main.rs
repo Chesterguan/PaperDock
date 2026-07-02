@@ -77,6 +77,12 @@ struct Config {
 }
 
 #[derive(Clone, Deserialize)]
+struct PaperRef {
+    key: String,
+    citation: String,
+}
+
+#[derive(Clone, Deserialize)]
 struct RefItem {
     item_key: String,
     citation: String,
@@ -140,6 +146,8 @@ fn App() -> impl IntoView {
     let active_source = RwSignal::new(0usize); // which Sources tab is open
     let streaming = RwSignal::new(false);
     let check_mode = RwSignal::new(false); // false = Ask, true = Check citation
+    let papers = RwSignal::new(Vec::<PaperRef>::new()); // collection's papers (check mode)
+    let source_key = RwSignal::new(String::new()); // "" = all papers, else one paper's key
     // Conversation thread: `asked` is the current in-progress question; `history`
     // holds completed turns above it.
     let asked = RwSignal::new(String::new());
@@ -428,6 +436,32 @@ fn App() -> impl IntoView {
         index();
     };
 
+    // In Check mode, load the collection's papers so the user can target one.
+    Effect::new(move |_| {
+        if !check_mode.get() {
+            return;
+        }
+        let id = selected.get();
+        if id.is_empty() {
+            return;
+        }
+        let (library, key) = id.split_once("::").unwrap_or(("users/0", id.as_str()));
+        let (library, key) = (library.to_string(), key.to_string());
+        source_key.set(String::new());
+        spawn_local(async move {
+            if let Ok(v) = invoke(
+                "list_collection_papers",
+                args(serde_json::json!({ "library": library, "collectionKey": key })),
+            )
+            .await
+            {
+                if let Ok(list) = serde_wasm_bindgen::from_value::<Vec<PaperRef>>(v) {
+                    papers.set(list);
+                }
+            }
+        });
+    });
+
     let submit = move || {
         let q = question.get();
         let id = selected.get();
@@ -480,6 +514,7 @@ fn App() -> impl IntoView {
                     "check",
                     args(serde_json::json!({
                         "library": library, "collectionKey": key, "claim": q,
+                        "sourceKey": source_key.get_untracked(),
                     })),
                 )
                 .await
@@ -769,6 +804,18 @@ fn App() -> impl IntoView {
                     title="Paste a claim and check whether these papers support it"
                 >"Check citation"</button>
             </div>
+
+            {move || check_mode.get().then(|| view! {
+                <select
+                    class="source-select"
+                    on:change=move |ev| source_key.set(event_target_value(&ev))
+                >
+                    <option value="">"All papers in the collection"</option>
+                    {move || papers.get().into_iter().map(|p| view! {
+                        <option value=p.key>{p.citation}</option>
+                    }).collect::<Vec<_>>()}
+                </select>
+            })}
 
             <div class="askrow">
                 <input

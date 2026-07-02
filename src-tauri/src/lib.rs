@@ -61,6 +61,7 @@ async fn ask(
         collection_key,
         question,
         history.unwrap_or_default(),
+        None,
     )
     .await
 }
@@ -76,8 +77,44 @@ async fn check(
     library: String,
     collection_key: String,
     claim: String,
+    #[allow(non_snake_case)] source_key: Option<String>,
 ) -> Result<(), String> {
-    spawn_worker(app, state, "check", library, collection_key, claim, String::new()).await
+    let sk = source_key.filter(|s| !s.is_empty());
+    spawn_worker(app, state, "check", library, collection_key, claim, String::new(), sk).await
+}
+
+/// One checkable paper (has a PDF) in a collection — for the citation-check
+/// source picker.
+#[derive(serde::Serialize)]
+struct PaperRef {
+    key: String,
+    citation: String,
+}
+
+/// List the papers (with PDFs) in a collection, so Check mode can target one.
+#[tauri::command]
+async fn list_collection_papers(
+    state: State<'_, AppState>,
+    library: String,
+    collection_key: String,
+) -> Result<Vec<PaperRef>, String> {
+    let data_dir = {
+        state
+            .config
+            .lock()
+            .map_err(|_| "Config is unavailable.".to_string())?
+            .zotero_data_dir
+            .clone()
+    };
+    let resolved = zotero::collection_docs(&library, &collection_key, &data_dir).await?;
+    Ok(resolved
+        .docs
+        .into_iter()
+        .map(|d| PaperRef {
+            key: d.zotero_key,
+            citation: d.citation,
+        })
+        .collect())
 }
 
 /// Pre-embed a collection into the shared index (no LLM query), so later asks
@@ -97,6 +134,7 @@ async fn index_collection(
         collection_key,
         String::new(),
         String::new(),
+        None,
     )
     .await
 }
@@ -112,6 +150,7 @@ async fn spawn_worker(
     collection_key: String,
     question: String,
     history: String,
+    source_key: Option<String>,
 ) -> Result<(), String> {
     // Snapshot the config values we need without holding the lock across await.
     let (model, embedding, api_base, data_dir, api_key, qdrant_url, qdrant_key) = {
@@ -131,8 +170,13 @@ async fn spawn_worker(
     };
 
     let resolved = zotero::collection_docs(&library, &collection_key, &data_dir).await?;
-    let docs: Vec<DocRef> = resolved.docs;
+    let mut docs: Vec<DocRef> = resolved.docs;
     let skipped = resolved.skipped;
+    // Citation-check may target ONE paper (the specific cited source) instead of
+    // the whole collection.
+    if let Some(sk) = &source_key {
+        docs.retain(|d| &d.zotero_key == sk);
+    }
 
     // Scope the shared Qdrant index per library+collection so group and
     // personal collections with the same key never collide.
@@ -504,6 +548,7 @@ pub fn run() {
             list_collections,
             ask,
             check,
+            list_collection_papers,
             index_collection,
             cancel,
             env_status,
