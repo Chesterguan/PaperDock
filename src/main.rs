@@ -135,6 +135,7 @@ fn App() -> impl IntoView {
     let asked = RwSignal::new(String::new());
     let history = RwSignal::new(Vec::<Turn>::new());
     let turn_id = RwSignal::new(0usize);
+    let notice = RwSignal::new(String::new()); // coverage heads-up (skipped PDFs)
     let has_key = RwSignal::new(true); // assume present until startup says otherwise
     let key_input = RwSignal::new(String::new());
     // Settings panel (model / embedding / base URL / key).
@@ -169,6 +170,11 @@ fn App() -> impl IntoView {
                     if let Some(items) = e.items {
                         refs.set(items);
                         active_source.set(0);
+                    }
+                }
+                "notice" => {
+                    if let Some(t) = e.message {
+                        notice.set(t);
                     }
                 }
                 "done" => {
@@ -279,6 +285,7 @@ fn App() -> impl IntoView {
         asked.set(String::new());
         answer.set(String::new());
         refs.set(Vec::new());
+        notice.set(String::new());
         spawn_local(async move {
             let _ = invoke("set_last_collection", args(serde_json::json!({ "key": k }))).await;
         });
@@ -314,6 +321,7 @@ fn App() -> impl IntoView {
         answer.set(String::new());
         refs.set(Vec::new());
         active_source.set(0);
+        notice.set(String::new());
         streaming.set(true);
         status.set("Indexing…".to_string());
         spawn_local(async move {
@@ -502,6 +510,10 @@ fn App() -> impl IntoView {
             // Current question (shown above its streaming answer).
             {move || (!asked.get().is_empty())
                 .then(|| view! { <div class="turn-q">{asked.get()}</div> })}
+
+            // Coverage heads-up when some papers had no PDF.
+            {move || (!notice.get().is_empty())
+                .then(|| view! { <div class="notice">{notice.get()}</div> })}
 
             <div class="answer">
                 // While waiting (no tokens yet) show a spinner next to the live

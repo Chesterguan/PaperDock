@@ -13,6 +13,8 @@ pub enum AnswerEvent {
     Status { text: String },
     Token { text: String },
     References { items: Vec<RefItem> },
+    /// A non-fatal heads-up (e.g. some papers had no PDF and were skipped).
+    Notice { message: String },
     Done,
     Error { message: String },
 }

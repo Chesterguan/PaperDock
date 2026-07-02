@@ -95,20 +95,51 @@ async fn spawn_worker(
         )
     };
 
-    let docs: Vec<DocRef> = zotero::collection_docs(&library, &collection_key, &data_dir).await?;
+    let resolved = zotero::collection_docs(&library, &collection_key, &data_dir).await?;
+    let docs: Vec<DocRef> = resolved.docs;
+    let skipped = resolved.skipped;
 
     // Scope the shared Qdrant index per library+collection so group and
     // personal collections with the same key never collide.
     let scope = format!("{}_{}", library.replace('/', "_"), collection_key);
 
     if docs.is_empty() {
+        let msg = if skipped.is_empty() {
+            "No PDFs found in this collection.".to_string()
+        } else {
+            format!(
+                "None of the {} papers have a PDF downloaded. Open them in Zotero and \
+                 sync/download the PDFs, then try again.",
+                skipped.len()
+            )
+        };
+        let _ = app.emit("answer", AnswerEvent::Error { message: msg });
+        return Ok(());
+    }
+
+    // Partial coverage: some papers have no PDF on disk — tell the user which,
+    // so a silently-narrowed answer never reads as complete.
+    if !skipped.is_empty() {
+        let total = docs.len() + skipped.len();
+        let mut names = skipped.clone();
+        names.truncate(6);
+        let more = skipped.len().saturating_sub(names.len());
+        let mut list = names.join(", ");
+        if more > 0 {
+            list.push_str(&format!(", +{more} more"));
+        }
         let _ = app.emit(
             "answer",
-            AnswerEvent::Error {
-                message: "No PDFs found in this collection.".to_string(),
+            AnswerEvent::Notice {
+                message: format!(
+                    "Answering from {} of {} papers — {} have no PDF downloaded: {}",
+                    docs.len(),
+                    total,
+                    skipped.len(),
+                    list
+                ),
             },
         );
-        return Ok(());
     }
 
     let n = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);

@@ -28,6 +28,13 @@ pub struct DocRef {
     pub citation: String,
 }
 
+/// Result of resolving a collection: the papers with a usable PDF, plus the
+/// citations of real papers that were skipped because no PDF is on disk.
+pub struct CollectionDocs {
+    pub docs: Vec<DocRef>,
+    pub skipped: Vec<String>,
+}
+
 fn client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -167,13 +174,13 @@ async fn collections_in(
     out
 }
 
-/// Resolve every top-level item in a collection to a DocRef, keeping only
-/// those with an existing PDF on disk.
+/// Resolve every top-level item in a collection to a DocRef, keeping those with
+/// an existing PDF on disk and reporting the ones skipped (no PDF).
 pub async fn collection_docs(
     library: &str,
     collection_key: &str,
     data_dir: &str,
-) -> Result<Vec<DocRef>, String> {
+) -> Result<CollectionDocs, String> {
     let c = client()?;
     let url = if collection_key == ALL_ITEMS {
         format!("{}/items/top", base(library))
@@ -226,23 +233,33 @@ pub async fn collection_docs(
         candidates.push((item_key, build_citation(data)));
     }
 
-    let docs: Vec<DocRef> = stream::iter(candidates)
+    let resolved: Vec<(String, Option<DocRef>)> = stream::iter(candidates)
         .map(|(item_key, citation)| {
             let c = &c;
             async move {
-                let path = resolve_pdf_path(c, library, &item_key, data_dir).await?;
-                Some(DocRef {
-                    path,
-                    zotero_key: item_key,
-                    citation,
-                })
+                let doc = resolve_pdf_path(c, library, &item_key, data_dir)
+                    .await
+                    .map(|path| DocRef {
+                        path,
+                        zotero_key: item_key,
+                        citation: citation.clone(),
+                    });
+                (citation, doc)
             }
         })
         .buffered(8)
-        .filter_map(|opt| async move { opt })
         .collect()
         .await;
-    Ok(docs)
+
+    let mut docs = Vec::new();
+    let mut skipped = Vec::new();
+    for (citation, doc) in resolved {
+        match doc {
+            Some(d) => docs.push(d),
+            None => skipped.push(citation),
+        }
+    }
+    Ok(CollectionDocs { docs, skipped })
 }
 
 /// citation = first creator lastName + " " + year, fallback to title[..40].
