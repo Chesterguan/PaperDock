@@ -184,6 +184,20 @@ async def answer_real(req):
     # "Failed to parse … citation" noise.
     settings.parsing.use_doc_details = False
 
+    # Multi-turn: give the ANSWER LLM the last couple of Q&A turns so follow-ups
+    # ("that method", "why?") resolve. Injected into the answer prompt only —
+    # retrieval still runs on the clean question below, so old topics don't
+    # pollute the PDF evidence search.
+    # ponytail: 2-turn cap is enforced frontend-side; brace-escape here so LaTeX
+    # or JSON braces in a prior answer can't break the qa template's .format().
+    history_text = (req.get("history") or "").strip()
+    if history_text and not index_only:
+        safe = history_text.replace("{", "{{").replace("}", "}}")
+        settings.prompts.qa = (
+            "Earlier in this conversation (context; the user may refer back to "
+            "it):\n" + safe + "\n\n" + settings.prompts.qa
+        )
+
     # Where does the vector index live?
     #  - Qdrant Cloud (if configured): a SHARED index, scoped per Zotero
     #    collection + embedding model. Papers embedded by anyone in the org are
@@ -196,7 +210,12 @@ async def answer_real(req):
     qdrant_url = (req.get("qdrant_url") or "").strip()
     qdrant_key = (req.get("qdrant_key") or "").strip()
     collection_key = (req.get("collection_key") or "").strip()
-    use_qdrant = bool(qdrant_url and collection_key)
+    # Only SHARED group libraries go to the team Qdrant cloud. Personal libraries
+    # (scope "users_0_…") stay in a LOCAL on-disk index so private papers never
+    # leave the machine. (collection_key is "<library>_<zoteroKey>" from Rust;
+    # group libraries are "groups_<id>_…".) NaviGator has no usable per-user
+    # vector store — its virtual key is locked to llm_api_routes — so local it is.
+    use_qdrant = bool(qdrant_url and collection_key and collection_key.startswith("groups_"))
     emb_tag = re.sub(r"[^A-Za-z0-9]+", "_", str(settings.embedding))[:40].strip("_")
 
     docs = None

@@ -1,0 +1,64 @@
+# PaperDock
+
+Ask questions about your Zotero papers and get answers with citations you can
+click to open the source PDF. Runs on your Mac; your library never leaves it.
+
+---
+
+## 1. Install
+
+1. Download **`PaperDock_0.1.0_universal.dmg`** (works on both Apple Silicon and
+   Intel Macs).
+2. Open the DMG, drag **PaperDock** into Applications.
+3. **First launch: right-click PaperDock → Open** (then click *Open* in the
+   dialog). The normal double-click is blocked because the app isn't
+   code-signed — you only need the right-click trick the first time.
+4. On first launch PaperDock does a **one-time setup** (downloads a small Python
+   environment, ~1–2 min, needs internet). Click **Set up now** and wait for it
+   to finish. This happens once.
+
+---
+
+## 2. Set up Zotero (do this once) — important
+
+PaperDock reads your library through Zotero's local connection. Three things
+must be true, and **step 2 is the one people miss:**
+
+1. **Use Zotero 7 or newer.** The local connection PaperDock needs does not
+   exist in Zotero 6. (Check *Zotero → About Zotero*.)
+
+2. **Turn on the local connection.** In Zotero:
+   **Settings → Advanced → General →** check
+   **"Allow other applications on this computer to communicate with Zotero."**
+   Without this, PaperDock stays stuck on *"Waiting for Zotero…"* no matter what.
+   *(You do **not** need to log in to a Zotero account — PaperDock only reads
+   your local library.)*
+
+3. **Keep Zotero running** while you use PaperDock, and make sure the papers you
+   want to ask about are **in a collection** with their **PDFs downloaded**
+   (a paper with no PDF can't be read).
+
+**Quick check:** with Zotero open, visit this in any browser —
+`http://localhost:23119/api/users/0/items/top?limit=1`.
+If it returns something (even empty), the connection is on.
+
+---
+
+## 3. Use it
+
+1. Pick a **collection** from the dropdown.
+2. Type a question and press **Enter**.
+3. You get a grounded answer with **citations** — click one to open that paper
+   in Zotero. Ask follow-up questions in the same thread.
+
+---
+
+## Troubleshooting
+
+| You see… | Fix |
+|---|---|
+| **"Waiting for Zotero…"** (won't clear) | Zotero isn't running, isn't v7+, or the **"Allow other applications…"** setting (step 2 above) is off. |
+| **"no Zotero collections found"** | Your library/collection is empty — add papers to a collection in Zotero. |
+| **"…papers have no PDF downloaded"** | Open those papers in Zotero and download/sync their PDFs, then ask again. |
+| macOS says the app **"is damaged" / can't be opened** | Right-click the app → **Open** (it's unsigned, not actually damaged). |
+| Setup screen shows an **error** | Check your internet connection and click **Try again** — first-run setup needs to download packages. |

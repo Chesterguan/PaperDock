@@ -24,3 +24,4 @@ config.local.json
 
 # Team defaults with real keys — bundled into the .app, never committed
 /src-tauri/team_config.json
+/src-tauri/bin/uv

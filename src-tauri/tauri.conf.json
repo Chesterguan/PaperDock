@@ -26,7 +26,13 @@
   },
   "bundle": {
     "active": true,
-    "targets": "app",
+    "targets": ["app", "dmg"],
+    "resources": {
+      "team_config.json": "team_config.json",
+      "bin/uv": "bin/uv",
+      "../sidecar/paperdock_worker.py": "paperdock_worker.py",
+      "../sidecar/requirements.lock": "requirements.lock"
+    },
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

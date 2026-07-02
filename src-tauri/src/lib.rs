@@ -51,8 +51,18 @@ async fn ask(
     library: String,
     collection_key: String,
     question: String,
+    #[allow(non_snake_case)] history: Option<String>,
 ) -> Result<(), String> {
-    spawn_worker(app, state, "ask", library, collection_key, question).await
+    spawn_worker(
+        app,
+        state,
+        "ask",
+        library,
+        collection_key,
+        question,
+        history.unwrap_or_default(),
+    )
+    .await
 }
 
 /// Pre-embed a collection into the shared index (no LLM query), so later asks
@@ -64,7 +74,16 @@ async fn index_collection(
     library: String,
     collection_key: String,
 ) -> Result<(), String> {
-    spawn_worker(app, state, "index", library, collection_key, String::new()).await
+    spawn_worker(
+        app,
+        state,
+        "index",
+        library,
+        collection_key,
+        String::new(),
+        String::new(),
+    )
+    .await
 }
 
 /// Shared path for ask + index: resolve the collection's PDFs and spawn the
@@ -77,6 +96,7 @@ async fn spawn_worker(
     library: String,
     collection_key: String,
     question: String,
+    history: String,
 ) -> Result<(), String> {
     // Snapshot the config values we need without holding the lock across await.
     let (model, embedding, api_base, data_dir, api_key, qdrant_url, qdrant_key) = {
@@ -164,6 +184,7 @@ async fn spawn_worker(
             cmd,
             request_id,
             question,
+            history,
             model,
             embedding,
             api_base,
@@ -188,6 +209,21 @@ async fn spawn_worker(
 #[tauri::command]
 async fn cancel(state: State<'_, AppState>) -> Result<(), String> {
     sidecar::cancel(state.child.clone()).await;
+    Ok(())
+}
+
+/// True once the Python reading environment is ready (skips first-run setup).
+#[tauri::command]
+fn env_status(app: tauri::AppHandle, state: State<'_, AppState>) -> bool {
+    sidecar::env_ready(&app, &state.worker_path)
+}
+
+/// Provision the Python environment on first run. Preflights disk/space, then
+/// streams `setup` events (status / done / error) as `uv` works.
+#[tauri::command]
+async fn setup_env(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let worker_path = state.worker_path.clone();
+    sidecar::setup_env(app, worker_path).await;
     Ok(())
 }
 
@@ -380,6 +416,8 @@ pub fn run() {
             ask,
             index_collection,
             cancel,
+            env_status,
+            setup_env,
             open_in_zotero,
             open_url,
             get_config,

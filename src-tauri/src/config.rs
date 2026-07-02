@@ -68,7 +68,19 @@ impl Config {
     pub fn load(app: &tauri::AppHandle) -> Config {
         if let Ok(path) = config_path(app) {
             if let Ok(raw) = fs::read_to_string(&path) {
-                if let Ok(cfg) = serde_json::from_str::<Config>(&raw) {
+                if let Ok(mut cfg) = serde_json::from_str::<Config>(&raw) {
+                    // Self-heal: a saved config with no key (e.g. seeded before the
+                    // team key existed) would otherwise stay keyless forever. If the
+                    // bundle ships a key, backfill it so the key never "disappears".
+                    let blank = cfg.api_key.as_deref().is_none_or(|k| k.trim().is_empty());
+                    if blank {
+                        if let Some(team) = Self::bundled_team_config(app) {
+                            if team.api_key.as_deref().is_some_and(|k| !k.trim().is_empty()) {
+                                cfg.api_key = team.api_key;
+                                let _ = cfg.save(app);
+                            }
+                        }
+                    }
                     return cfg;
                 }
             }

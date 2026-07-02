@@ -1,8 +1,9 @@
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 
 use serde_json::{json, Value};
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
@@ -48,6 +49,7 @@ pub async fn run_ask(
     cmd: &str,
     request_id: String,
     question: String,
+    history: String,
     model: String,
     embedding: String,
     api_base: String,
@@ -74,6 +76,7 @@ pub async fn run_ask(
         "id": request_id,
         "cmd": cmd,
         "question": question,
+        "history": history,
         "index_name": cache_dir_index_name(&cache_dir),
         "cache_dir": cache_dir,
         "model": model,
@@ -100,7 +103,7 @@ pub async fn run_ask(
     };
     line.push('\n');
 
-    let mut child = match Command::new(python_for_worker(&worker_path))
+    let mut child = match Command::new(python_for_worker(&app, &worker_path))
         .arg(&worker_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -212,16 +215,201 @@ async fn clear_slot(child_slot: &ChildSlot) {
     }
 }
 
-/// Prefer the sidecar's bundled venv interpreter (PaperQA needs 3.11+); fall
-/// back to system `python3` (e.g. the stdlib mock) if no venv is present.
-fn python_for_worker(worker_path: &str) -> String {
-    if let Some(dir) = std::path::Path::new(worker_path).parent() {
-        let venv = dir.join(".venv/bin/python");
-        if venv.exists() {
-            return venv.to_string_lossy().into_owned();
+/// Prefer a real PaperQA interpreter (needs 3.11+); fall back to system
+/// `python3` only if none is provisioned.
+fn python_for_worker(app: &tauri::AppHandle, worker_path: &str) -> String {
+    resolve_python(app, worker_path).unwrap_or_else(|| "python3".to_string())
+}
+
+// ---- First-run Python environment provisioning -------------------------
+//
+// A packaged .app ships only the worker + a `uv` binary + a pinned
+// requirements list — NOT the 287 MB venv. On first launch the app asks the
+// user, then uses `uv` to fetch a relocatable Python and the deps into the app
+// data dir. The app is online-only anyway (remote LLM + Qdrant), so a one-time
+// online setup costs nothing, keeps the DMG ~50 MB, and works on any Mac arch.
+
+/// The first-run-provisioned venv location (inside the app data dir).
+fn pyenv_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+    app.path().app_config_dir().ok().map(|d| d.join("pyenv"))
+}
+
+/// A usable interpreter if one exists: the provisioned venv (release) or the
+/// dev `.venv` next to the worker. `None` => first-run setup is needed.
+fn resolve_python(app: &tauri::AppHandle, worker_path: &str) -> Option<String> {
+    if let Some(py) = pyenv_dir(app).map(|d| d.join("bin/python")) {
+        if py.exists() {
+            return Some(py.to_string_lossy().into_owned());
         }
     }
-    "python3".to_string()
+    if let Some(dir) = Path::new(worker_path).parent() {
+        let venv = dir.join(".venv/bin/python");
+        if venv.exists() {
+            return Some(venv.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// True once a PaperQA-capable interpreter is available (no setup needed).
+pub fn env_ready(app: &tauri::AppHandle, worker_path: &str) -> bool {
+    resolve_python(app, worker_path).is_some()
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum SetupEvent {
+    Status { message: String },
+    Done,
+    Error { message: String },
+}
+
+/// Find the bundled `uv` (release resource, dev copy, or PATH).
+fn uv_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    if let Ok(res) = app.path().resource_dir() {
+        let p = res.join("bin/uv");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    for p in ["src-tauri/bin/uv", "bin/uv"] {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    None
+}
+
+/// Find the pinned requirements list (release resource or dev copy).
+fn reqs_path(app: &tauri::AppHandle) -> Option<PathBuf> {
+    if let Ok(res) = app.path().resource_dir() {
+        let p = res.join("requirements.lock");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    for p in ["sidecar/requirements.lock", "../sidecar/requirements.lock"] {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Some(pb);
+        }
+    }
+    None
+}
+
+/// Free bytes on the volume holding `dir` (via `df -Pk`). None if unknown.
+fn free_bytes(dir: &Path) -> Option<u64> {
+    let out = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(dir)
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let avail_kb: u64 = text.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()?;
+    Some(avail_kb.saturating_mul(1024))
+}
+
+/// Provision the Python env with `uv`, streaming progress as `setup` events.
+/// Preflight-checks disk/space/writability first so a first run can never wedge
+/// or fill the user's machine. Never returns Err to the UI un-humanized.
+pub async fn setup_env(app: tauri::AppHandle, worker_path: String) {
+    let err = |m: String| {
+        let _ = app.emit("setup", SetupEvent::Error { message: m });
+    };
+    let status = |m: &str| {
+        let _ = app.emit("setup", SetupEvent::Status { message: m.to_string() });
+    };
+
+    if env_ready(&app, &worker_path) {
+        let _ = app.emit("setup", SetupEvent::Done);
+        return;
+    }
+
+    // ---- preflight: fail loud and early, never touch the system on failure --
+    let (Some(uv), Some(reqs), Some(pyenv)) =
+        (uv_path(&app), reqs_path(&app), pyenv_dir(&app))
+    else {
+        return err(
+            "This build is missing its setup files (uv / requirements). \
+             Please reinstall PaperDock."
+                .into(),
+        );
+    };
+    let Some(app_dir) = pyenv.parent().map(Path::to_path_buf) else {
+        return err("Could not locate the app data folder.".into());
+    };
+    if std::fs::create_dir_all(&app_dir).is_err() {
+        return err("Cannot write to the app data folder — check permissions.".into());
+    }
+    // ~1.5 GB headroom: managed Python (~80 MB) + deps (~300 MB) + build slack.
+    const NEED: u64 = 1_500_000_000;
+    if let Some(free) = free_bytes(&app_dir) {
+        if free < NEED {
+            return err(format!(
+                "Not enough free disk space for setup — about 1.5 GB needed, \
+                 {:.1} GB free. Free some space and try again.",
+                free as f64 / 1e9
+            ));
+        }
+    }
+
+    // ---- provision (idempotent; a re-run repairs a half-built env) ----------
+    status("Downloading Python (one-time)…");
+    let pyenv_s = pyenv.to_string_lossy().into_owned();
+    if !run_uv(&app, &uv, &["venv", &pyenv_s, "--python", "3.12"]).await {
+        return err(
+            "Could not set up Python. Check your internet connection and retry."
+                .into(),
+        );
+    }
+    status("Installing packages (this can take a minute)…");
+    let py = format!("{pyenv_s}/bin/python");
+    let reqs_s = reqs.to_string_lossy().into_owned();
+    if !run_uv(&app, &uv, &["pip", "install", "--python", &py, "-r", &reqs_s]).await {
+        return err(
+            "Could not install the reading packages. Check your connection and retry."
+                .into(),
+        );
+    }
+
+    if env_ready(&app, &worker_path) {
+        status("Ready.");
+        let _ = app.emit("setup", SetupEvent::Done);
+    } else {
+        err("Setup finished but the environment is incomplete. Please retry.".into());
+    }
+}
+
+/// Run a `uv` subcommand, streaming its stderr progress lines to the UI.
+/// Returns true on a clean exit. Forces a managed (relocatable) Python so the
+/// interpreter is identical on every machine, never the user's system one.
+async fn run_uv(app: &tauri::AppHandle, uv: &Path, uv_args: &[&str]) -> bool {
+    let mut child = match Command::new(uv)
+        .args(uv_args)
+        .env("UV_PYTHON_PREFERENCE", "only-managed")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    if let Some(stderr) = child.stderr.take() {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let line = line.trim();
+            // uv's progress lines are terse and safe to show; skip blanks.
+            if !line.is_empty() {
+                let _ = app.emit(
+                    "setup",
+                    SetupEvent::Status { message: line.to_string() },
+                );
+            }
+        }
+    }
+    matches!(child.wait().await, Ok(s) if s.success())
 }
 
 fn cache_dir_index_name(cache_dir: &str) -> String {

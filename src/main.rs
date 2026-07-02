@@ -113,6 +113,15 @@ struct AnswerEvent {
     message: Option<String>,
 }
 
+/// Rotating tips shown during the one-time setup wait — get the user's Zotero
+/// ready so they can ask a question the moment setup finishes.
+const SETUP_TIPS: &[&str] = &[
+    "While this installs — open Zotero (7+). PaperDock reads your library through it.",
+    "Tip: in Zotero, download the PDFs for the papers you want to ask about.",
+    "Tip: group papers into a Zotero collection to focus your questions.",
+    "Answers cite their sources — click a citation to open that paper in Zotero.",
+];
+
 fn main() {
     console_error_panic_hook::set_once();
     leptos::mount::mount_to_body(App);
@@ -145,6 +154,14 @@ fn App() -> impl IntoView {
     let apibase_input = RwSignal::new(String::new());
     let qdrant_url_input = RwSignal::new(String::new());
     let qdrant_key_input = RwSignal::new(String::new());
+    // First-run Python environment setup.
+    let env_ready = RwSignal::new(true); // assume ready until startup says otherwise
+    let setup_running = RwSignal::new(false);
+    let setup_status = RwSignal::new(String::new());
+    let setup_error = RwSignal::new(String::new());
+    let tip_idx = RwSignal::new(0usize); // rotates the "get ready" tips
+    let remembered = RwSignal::new(Option::<String>::None); // last collection to preselect
+    let collections_ready = RwSignal::new(false); // collections have been fetched at least once
 
     // ---- single "answer" event listener, wired once at startup ----------
     {
@@ -199,13 +216,82 @@ fn App() -> impl IntoView {
         });
     }
 
-    // ---- startup: config -> status -> collections -----------------------
+    // ---- first-run setup: "setup" events + env readiness check ----------
+    {
+        let cb = Closure::<dyn FnMut(JsValue)>::new(move |ev: JsValue| {
+            let payload = js_sys::Reflect::get(&ev, &JsValue::from_str("payload"))
+                .unwrap_or(JsValue::NULL);
+            let Ok(e) = serde_wasm_bindgen::from_value::<AnswerEvent>(payload) else {
+                return;
+            };
+            match e.kind.as_str() {
+                "status" => {
+                    if let Some(m) = e.message {
+                        setup_status.set(m);
+                    }
+                }
+                "done" => {
+                    setup_running.set(false);
+                    env_ready.set(true);
+                }
+                "error" => {
+                    setup_running.set(false);
+                    setup_error
+                        .set(e.message.unwrap_or_else(|| "Setup failed. Try again.".into()));
+                }
+                _ => {}
+            }
+        });
+        spawn_local(async move {
+            let _ = listen("setup", cb.as_ref()).await;
+            cb.forget();
+        });
+    }
     spawn_local(async move {
-        // Remembered collection.
-        let mut remembered: Option<String> = None;
+        // If the reading environment isn't provisioned yet, the setup screen
+        // shows. Assume ready on any hiccup so we never block a working dev app.
+        let ready = invoke("env_status", args(serde_json::json!({})))
+            .await
+            .ok()
+            .and_then(|v| serde_wasm_bindgen::from_value::<bool>(v).ok())
+            .unwrap_or(true);
+        env_ready.set(ready);
+    });
+    // Re-check Zotero and, the moment it comes up, load collections. Safe to
+    // call repeatedly: it only fetches collections while none are loaded yet,
+    // so opening Zotero AFTER launch recovers without a restart.
+    let refresh = move || {
+        spawn_local(async move {
+            let up = invoke("zotero_status", args(serde_json::json!({})))
+                .await
+                .ok()
+                .and_then(|v| serde_wasm_bindgen::from_value::<bool>(v).ok())
+                .unwrap_or(false);
+            zotero_ok.set(up);
+            if !up || !collections.get_untracked().is_empty() {
+                return;
+            }
+            if let Ok(v) = invoke("list_collections", args(serde_json::json!({}))).await {
+                if let Ok(list) = serde_wasm_bindgen::from_value::<Vec<Collection>>(v) {
+                    let preselect = remembered
+                        .get_untracked()
+                        .filter(|id| list.iter().any(|c| &c.id() == id))
+                        .or_else(|| list.first().map(|c| c.id()));
+                    if let Some(id) = preselect {
+                        selected.set(id);
+                    }
+                    collections.set(list);
+                    collections_ready.set(true);
+                }
+            }
+        });
+    };
+
+    // ---- startup: read config, then poll Zotero until it's up -----------
+    spawn_local(async move {
         if let Ok(v) = invoke("get_config", args(serde_json::json!({}))).await {
             if let Ok(cfg) = serde_wasm_bindgen::from_value::<Config>(v) {
-                remembered = cfg.last_collection;
+                remembered.set(cfg.last_collection);
                 has_key.set(cfg.has_api_key);
                 model_input.set(cfg.model);
                 embedding_input.set(cfg.embedding);
@@ -218,36 +304,33 @@ fn App() -> impl IntoView {
                 }
             }
         }
-
-        // Is Zotero up?
-        let up = invoke("zotero_status", args(serde_json::json!({})))
-            .await
-            .ok()
-            .and_then(|v| serde_wasm_bindgen::from_value::<bool>(v).ok())
-            .unwrap_or(false);
-        zotero_ok.set(up);
-
-        if !up {
-            return; // dropdown stays empty; status shows "Waiting for Zotero..."
-        }
-
-        // Collections.
-        if let Ok(v) = invoke("list_collections", args(serde_json::json!({}))).await {
-            if let Ok(list) = serde_wasm_bindgen::from_value::<Vec<Collection>>(v) {
-                // Preselect remembered collection if still present, else first.
-                let preselect = remembered
-                    .filter(|id| list.iter().any(|c| &c.id() == id))
-                    .or_else(|| list.first().map(|c| c.id()));
-                if let Some(id) = preselect {
-                    selected.set(id);
-                }
-                collections.set(list);
-                status.set("Indexed ✓".to_string());
-            }
-        }
+        refresh(); // first check now; the interval keeps retrying afterwards
     });
 
+    // Heartbeat: rotate setup tips while provisioning, and keep re-checking
+    // Zotero so "Waiting for Zotero…" clears on its own once the user opens it.
+    leptos::leptos_dom::helpers::set_interval(
+        move || {
+            if !env_ready.get() {
+                tip_idx.update(|i| *i = i.wrapping_add(1));
+            }
+            refresh();
+        },
+        std::time::Duration::from_secs(3),
+    );
+
     // ---- handlers -------------------------------------------------------
+    // Kick off first-run Python environment provisioning. Progress/errors
+    // arrive as `setup` events (wired above).
+    let start_setup = move || {
+        setup_error.set(String::new());
+        setup_running.set(true);
+        setup_status.set("Preparing…".to_string());
+        spawn_local(async move {
+            let _ = invoke("setup_env", args(serde_json::json!({}))).await;
+        });
+    };
+
     // Pre-embed the selected collection into the shared index (no LLM query).
     // Idempotent — only missing papers get embedded. Uses the streaming flag so
     // it can't overlap an ask, and the Stop button can cancel it.
@@ -316,6 +399,19 @@ fn App() -> impl IntoView {
                 })
             });
         }
+        // Multi-turn context: last 2 completed turns, answers truncated. Kept
+        // short on purpose — enough for follow-ups, bounded so it can't grow
+        // unbounded (cost / context-length). Retrieval stays on the clean
+        // question; the worker only feeds this to the answer LLM.
+        let turns = history.get();
+        let recent: Vec<_> = turns.iter().rev().take(2).collect();
+        let mut hist_text = String::new();
+        for t in recent.into_iter().rev() {
+            let a: String = t.answer.chars().take(400).collect();
+            let ell = if t.answer.chars().count() > 400 { "…" } else { "" };
+            hist_text.push_str(&format!("Q: {}\nA: {}{}\n\n", t.question, a, ell));
+        }
+
         asked.set(q.clone());
         question.set(String::new()); // clear input, ready for the next question
         answer.set(String::new());
@@ -329,6 +425,7 @@ fn App() -> impl IntoView {
                 "ask",
                 args(serde_json::json!({
                     "library": library, "collectionKey": key, "question": q,
+                    "history": hist_text,
                 })),
             )
             .await;
@@ -416,6 +513,60 @@ fn App() -> impl IntoView {
                 </button>
             </header>
 
+            {move || (!env_ready.get()).then(|| view! {
+                <div class="setup-overlay">
+                    <div class="setup-card">
+                        <h2>"First-time setup"</h2>
+                        <p class="setup-lead">
+                            "PaperDock needs a one-time Python environment to read \
+                             your papers — about 300 MB. It downloads once (needs \
+                             internet) and is cached for good."
+                        </p>
+                        {move || {
+                            let err = setup_error.get();
+                            if !err.is_empty() {
+                                view! {
+                                    <p class="setup-err">{err}</p>
+                                    <button class="ask" on:click=move |_| start_setup()>
+                                        "Try again"
+                                    </button>
+                                }.into_any()
+                            } else if setup_running.get() {
+                                view! {
+                                    <div class="setup-progress">
+                                        <span class="spinner"></span>
+                                        <span class="setup-line">{move || setup_status.get()}</span>
+                                    </div>
+                                    <div class="setup-tip">
+                                        {move || SETUP_TIPS[tip_idx.get() % SETUP_TIPS.len()]}
+                                    </div>
+                                    {move || if zotero_ok.get() {
+                                        view! {
+                                            <div class="setup-check ok">"✓ Zotero connected"</div>
+                                        }.into_any()
+                                    } else {
+                                        view! {
+                                            <div class="setup-check warn">
+                                                "○ Open Zotero (7+) so PaperDock can read your library"
+                                            </div>
+                                        }.into_any()
+                                    }}
+                                    <p class="setup-hint">
+                                        "This can take a minute. Keep the app open."
+                                    </p>
+                                }.into_any()
+                            } else {
+                                view! {
+                                    <button class="ask" on:click=move |_| start_setup()>
+                                        "Set up now"
+                                    </button>
+                                }.into_any()
+                            }
+                        }}
+                    </div>
+                </div>
+            })}
+
             {move || show_settings.get().then(|| view! {
                 <div class="settings">
                     <label class="slabel">"Chat model"</label>
@@ -483,8 +634,16 @@ fn App() -> impl IntoView {
                 class:waiting=move || !zotero_ok.get()
             >
                 {move || {
+                    // Make the blocker unambiguous: you need Zotero running AND a
+                    // collection before a question can run.
                     if !zotero_ok.get() {
-                        "Waiting for Zotero…".to_string()
+                        "Waiting for Zotero — open Zotero (7+) so PaperDock can read your library.".to_string()
+                    } else if !collections_ready.get() {
+                        "Connected to Zotero — loading your collections…".to_string()
+                    } else if collections.get().is_empty() {
+                        "Connected, but no Zotero collections found. Put some papers in a collection in Zotero and it will appear here.".to_string()
+                    } else if selected.get().is_empty() {
+                        "Pick a collection above to get started.".to_string()
                     } else {
                         status.get()
                     }
