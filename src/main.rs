@@ -162,6 +162,9 @@ fn App() -> impl IntoView {
     let tip_idx = RwSignal::new(0usize); // rotates the "get ready" tips
     let remembered = RwSignal::new(Option::<String>::None); // last collection to preselect
     let collections_ready = RwSignal::new(false); // collections have been fetched at least once
+    let needs_config = RwSignal::new(false); // true when no key configured (fresh install)
+    let export_key = RwSignal::new(true);    // "Include LLM key" checkbox
+    let toast = RwSignal::new(String::new()); // transient confirmation
 
     // ---- single "answer" event listener, wired once at startup ----------
     {
@@ -247,6 +250,27 @@ fn App() -> impl IntoView {
             cb.forget();
         });
     }
+
+    // ---- lab config import: "lab-imported" event (double-click or manual) --
+    {
+        let cb = Closure::<dyn FnMut(JsValue)>::new(move |ev: JsValue| {
+            let payload = js_sys::Reflect::get(&ev, &JsValue::from_str("payload"))
+                .unwrap_or(JsValue::NULL);
+            let name = payload.as_string().unwrap_or_default();
+            needs_config.set(false);
+            has_key.set(true);
+            show_settings.set(false);
+            toast.set(if name.is_empty() {
+                "Lab config imported ✓".to_string()
+            } else {
+                format!("Lab config imported ✓ ({name})")
+            });
+        });
+        spawn_local(async move {
+            let _ = listen("lab-imported", cb.as_ref()).await;
+            cb.forget();
+        });
+    }
     spawn_local(async move {
         // If the reading environment isn't provisioned yet, the setup screen
         // shows. Assume ready on any hiccup so we never block a working dev app.
@@ -297,10 +321,10 @@ fn App() -> impl IntoView {
                 embedding_input.set(cfg.embedding);
                 apibase_input.set(cfg.api_base);
                 qdrant_url_input.set(cfg.qdrant_url);
-                // First run with no key configured: open Settings so the user
-                // can add a key or point at a local (Ollama) model.
+                // First run with no key configured: show the "connect to your
+                // lab" gate (import a .paperdock config, or set up manually).
                 if !cfg.has_api_key {
-                    show_settings.set(true);
+                    needs_config.set(true);
                 }
             }
         }
@@ -513,6 +537,10 @@ fn App() -> impl IntoView {
                 </button>
             </header>
 
+            {move || (!toast.get().is_empty()).then(|| view! {
+                <div class="toast">{toast.get()}</div>
+            })}
+
             {move || (!env_ready.get()).then(|| view! {
                 <div class="setup-overlay">
                     <div class="setup-card">
@@ -567,6 +595,29 @@ fn App() -> impl IntoView {
                 </div>
             })}
 
+            {move || (env_ready.get() && needs_config.get()).then(|| view! {
+                <div class="setup-overlay">
+                    <div class="setup-card">
+                        <h2>"Connect to your lab"</h2>
+                        <p class="setup-lead">
+                            "Your lab admin sent you a "<b>".paperdock"</b>" config file. "
+                            "Double-click it to set up PaperDock, or import it here."
+                        </p>
+                        <button class="ask" on:click=move |_| {
+                            spawn_local(async move {
+                                let _ = invoke("import_lab_config", args(serde_json::json!({}))).await;
+                            });
+                        }>"Import lab config…"</button>
+                        <p class="setup-hint">
+                            "No file yet? Ask your admin, or "
+                            <a href="#" on:click=move |_| { needs_config.set(false); show_settings.set(true); }>
+                                "set it up manually"
+                            </a>"."
+                        </p>
+                    </div>
+                </div>
+            })}
+
             {move || show_settings.get().then(|| view! {
                 <div class="settings">
                     <label class="slabel">"Chat model"</label>
@@ -594,6 +645,23 @@ fn App() -> impl IntoView {
                         placeholder="•••"
                         on:input=move |ev| qdrant_key_input.set(event_target_value(&ev)) />
                     <button class="keysave" on:click=move |_| save_settings()>"Save"</button>
+
+                    <div class="lab-export">
+                        <label class="lab-export-row">
+                            <input type="checkbox"
+                                prop:checked=move || export_key.get()
+                                on:change=move |ev| export_key.set(event_target_checked(&ev)) />
+                            "Include LLM key (uncheck so members use their own)"
+                        </label>
+                        <button class="ask" on:click=move |_| {
+                            let inc = export_key.get();
+                            spawn_local(async move {
+                                let _ = invoke("export_lab_config",
+                                    args(serde_json::json!({ "includeKey": inc }))).await;
+                            });
+                        }>"Export lab config…"</button>
+                        <p class="setup-hint">"This file contains your keys — share it privately."</p>
+                    </div>
                 </div>
             })}
 
