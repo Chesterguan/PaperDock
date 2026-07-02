@@ -425,6 +425,20 @@ pub fn run() {
             set_api_key,
             set_settings,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running PaperDock");
+        .build(tauri::generate_context!())
+        .expect("error while building PaperDock")
+        .run(|app, event| {
+            if let tauri::RunEvent::Opened { urls } = event {
+                for url in urls {
+                    // macOS delivers file:// URLs for associated files.
+                    if let Ok(path) = url.to_file_path() {
+                        if path.extension().and_then(|e| e.to_str()) == Some("paperdock") {
+                            // Task 3 replaces this with real import + event emit.
+                            let _ = app;
+                            eprintln!("paperdock file opened: {}", path.display());
+                        }
+                    }
+                }
+            }
+        });
 }

@@ -33,6 +33,13 @@
       "../sidecar/paperdock_worker.py": "paperdock_worker.py",
       "../sidecar/requirements.lock": "requirements.lock"
     },
+    "fileAssociations": [
+      {
+        "ext": ["paperdock"],
+        "name": "PaperDock Lab Config",
+        "role": "Editor"
+      }
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
