@@ -376,6 +376,79 @@ fn set_last_collection(
     cfg.save(&app)
 }
 
+/// Read a `.paperdock` file, merge it into the live config, persist, and tell
+/// the UI. Returns the lab's display name. Never leaks a raw parse error.
+fn apply_lab_file(app: &tauri::AppHandle, path: &std::path::Path) -> Result<String, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|_| "Could not read that lab config file.".to_string())?;
+    let lab: config::LabConfig = serde_json::from_str(&raw)
+        .map_err(|_| "That doesn't look like a PaperDock lab config file.".to_string())?;
+    let name = lab.summary_name();
+    let saved = {
+        let state = app.state::<AppState>();
+        let mut guard = state
+            .config
+            .lock()
+            .map_err(|_| "Config is unavailable.".to_string())?;
+        guard.apply_lab_config(&lab);
+        guard.clone()
+    };
+    saved.save(app)?;
+    let _ = app.emit("lab-imported", name.clone());
+    Ok(name)
+}
+
+/// Export the shared config as a `.paperdock` file the admin distributes.
+/// Opens a save dialog; returns the written path, or "" if cancelled.
+#[tauri::command]
+async fn export_lab_config(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    include_key: bool,
+) -> Result<String, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let lab = {
+        let cfg = state
+            .config
+            .lock()
+            .map_err(|_| "Config is unavailable.".to_string())?;
+        cfg.to_lab_config(include_key)
+    };
+    let json = serde_json::to_string_pretty(&lab)
+        .map_err(|_| "Could not build the lab config.".to_string())?;
+    let file = app
+        .dialog()
+        .file()
+        .add_filter("PaperDock lab config", &["paperdock"])
+        .set_file_name("lab.paperdock")
+        .blocking_save_file();
+    let Some(file) = file else { return Ok(String::new()) };
+    let path = file
+        .into_path()
+        .map_err(|_| "Could not resolve the save path.".to_string())?;
+    std::fs::write(&path, json).map_err(|_| "Could not write the file.".to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Import a `.paperdock` file chosen via an open dialog. Returns the lab name.
+#[tauri::command]
+async fn import_lab_config(
+    app: tauri::AppHandle,
+    _state: State<'_, AppState>,
+) -> Result<String, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let file = app
+        .dialog()
+        .file()
+        .add_filter("PaperDock lab config", &["paperdock"])
+        .blocking_pick_file();
+    let Some(file) = file else { return Ok(String::new()) };
+    let path = file
+        .into_path()
+        .map_err(|_| "Could not resolve the file path.".to_string())?;
+    apply_lab_file(&app, &path)
+}
+
 // ----- Setup helpers -------------------------------------------------------
 
 /// Resolve the sidecar worker path, trying dev-relative locations first, then
@@ -399,6 +472,7 @@ fn resolve_worker_path(app: &tauri::AppHandle) -> String {
 /// Build, configure, and run the Tauri application.
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle();
             let worker_path = resolve_worker_path(handle);
@@ -424,6 +498,8 @@ pub fn run() {
             set_last_collection,
             set_api_key,
             set_settings,
+            export_lab_config,
+            import_lab_config,
         ])
         .build(tauri::generate_context!())
         .expect("error while building PaperDock")
@@ -433,9 +509,7 @@ pub fn run() {
                     // macOS delivers file:// URLs for associated files.
                     if let Ok(path) = url.to_file_path() {
                         if path.extension().and_then(|e| e.to_str()) == Some("paperdock") {
-                            // Task 3 replaces this with real import + event emit.
-                            let _ = app;
-                            eprintln!("paperdock file opened: {}", path.display());
+                            let _ = apply_lab_file(app, &path);
                         }
                     }
                 }
