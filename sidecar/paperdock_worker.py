@@ -63,6 +63,48 @@ def _missing_key_message(model: str, embedding: str):
     return None
 
 
+def _is_transient(exc) -> bool:
+    s = repr(exc).lower()
+    name = type(exc).__name__.lower()
+    return any(t in name or t in s for t in (
+        "ratelimit", "rate limit", "429", "timeout", "timed out",
+        "connection", "serviceunavailable", "503", "overloaded"))
+
+
+def _human_error(exc) -> str:
+    """Turn a raw exception into a specific, actionable message."""
+    s = repr(exc).lower()
+    name = type(exc).__name__.lower()
+    if "ratelimit" in name or "rate limit" in s or "429" in s:
+        return ("The AI service is rate-limited right now (shared key is busy). "
+                "Wait a few seconds and ask again.")
+    if "timeout" in name or "timed out" in s or "timeout" in s:
+        return "The AI service timed out. Please try again."
+    if ("authentication" in name or "api key" in s or "unauthorized" in s
+            or "401" in s or "403" in s):
+        return "The AI service rejected the API key — check it in Settings (⚙)."
+    if "connection" in name or "could not connect" in s or "connect" in s:
+        return "Couldn't reach the AI service. Check your network / VPN."
+    if "context" in s and ("length" in s or "maximum" in s or "token" in s):
+        return ("The question pulled in too much text for the model. "
+                "Try a narrower question or a smaller collection.")
+    return ("The AI service hit an unexpected error. Try again; if it keeps "
+            "happening, check the model/gateway in Settings (⚙).")
+
+
+async def _aquery_with_retry(docs, question, settings):
+    """Query once; retry a single time on a transient (rate-limit/timeout) error."""
+    for attempt in range(2):
+        try:
+            return await docs.aquery(question, settings=settings)
+        except Exception as exc:
+            if attempt == 0 and _is_transient(exc):
+                sys.stderr.write("transient query error, retrying: %r\n" % exc)
+                await asyncio.sleep(2.5)
+                continue
+            raise
+
+
 async def answer_real(req):
     qid = req["id"]
     index_only = req.get("cmd") == "index"  # pre-embed into Qdrant, no LLM query
@@ -195,6 +237,7 @@ async def answer_real(req):
 
     n_add = len(to_add)
     added_now = 0
+    had_transient_add_error = False
     verb = "Indexing" if index_only else "Reading"
     for i, d in enumerate(to_add, 1):
         # Live progress so a first-run (embedding) doesn't look frozen.
@@ -215,11 +258,20 @@ async def answer_real(req):
             )
             added_now += 1
         except Exception as exc:  # one bad PDF shouldn't sink the whole query
+            if _is_transient(exc):
+                had_transient_add_error = True
             sys.stderr.write("add failed for %s: %r\n" % (path, exc))
 
     if not docs.docs:
-        send({"id": qid, "type": "error",
-              "message": "Could not read any PDFs in this collection."})
+        # Distinguish "genuinely no readable PDFs" from a transient API hiccup
+        # while embedding (rate limit / timeout), which is retryable.
+        if had_transient_add_error:
+            send({"id": qid, "type": "error",
+                  "message": "The AI service was busy while indexing (rate limit / "
+                             "timeout). Wait a few seconds and try again."})
+        else:
+            send({"id": qid, "type": "error",
+                  "message": "Could not read any PDFs in this collection."})
         return
 
     # Persist. Qdrant is written automatically when aquery builds the index, so
@@ -248,7 +300,7 @@ async def answer_real(req):
         return
 
     send({"id": qid, "type": "status", "text": "Thinking…"})
-    session = await docs.aquery(question, settings=settings)
+    session = await _aquery_with_retry(docs, question, settings)
 
     text = (session.answer or "").strip()
     if not text:
@@ -325,7 +377,7 @@ def main():
                       "message": "Unknown command."})
         except Exception as exc:  # never leak a stack trace to the UI
             send({"id": req.get("id"), "type": "error",
-                  "message": "The query engine failed. See logs for details."})
+                  "message": _human_error(exc)})
             sys.stderr.write("worker error: %r\n" % exc)
 
 
