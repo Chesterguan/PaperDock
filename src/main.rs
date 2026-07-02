@@ -83,6 +83,16 @@ struct PaperRef {
 }
 
 #[derive(Clone, Deserialize)]
+struct RefMatchWire {
+    found: bool,
+    confidence: u8,
+    title: String,
+    doi: String,
+    authors: String,
+    year: String,
+}
+
+#[derive(Clone, Deserialize)]
 struct RefItem {
     item_key: String,
     citation: String,
@@ -145,9 +155,13 @@ fn App() -> impl IntoView {
     let refs = RwSignal::new(Vec::<RefItem>::new());
     let active_source = RwSignal::new(0usize); // which Sources tab is open
     let streaming = RwSignal::new(false);
-    let check_mode = RwSignal::new(false); // false = Ask, true = Check citation
+    let mode = RwSignal::new("ask".to_string()); // "ask" | "check" | "verify"
     let papers = RwSignal::new(Vec::<PaperRef>::new()); // collection's papers (check mode)
     let source_key = RwSignal::new(String::new()); // "" = all papers, else one paper's key
+    // Verify-reference (CrossRef prescreen) state.
+    let ref_input = RwSignal::new(String::new());
+    let ref_result = RwSignal::new(Option::<RefMatchWire>::None);
+    let verifying = RwSignal::new(false);
     // Conversation thread: `asked` is the current in-progress question; `history`
     // holds completed turns above it.
     let asked = RwSignal::new(String::new());
@@ -438,7 +452,7 @@ fn App() -> impl IntoView {
 
     // In Check mode, load the collection's papers so the user can target one.
     Effect::new(move |_| {
-        if !check_mode.get() {
+        if mode.get() != "check" {
             return;
         }
         let id = selected.get();
@@ -506,7 +520,7 @@ fn App() -> impl IntoView {
         notice.set(String::new());
         streaming.set(true);
         status.set("Indexing…".to_string());
-        let checking = check_mode.get_untracked();
+        let checking = mode.get_untracked() == "check";
         spawn_local(async move {
             let res = if checking {
                 // Citation-check: `q` is a claim; no conversation history.
@@ -542,6 +556,25 @@ fn App() -> impl IntoView {
             ev.prevent_default();
             submit();
         }
+    };
+
+    // Verify-reference (CrossRef prescreen): a direct command, not the worker.
+    let do_verify = move || {
+        let r = ref_input.get();
+        if r.trim().is_empty() || verifying.get() {
+            return;
+        }
+        verifying.set(true);
+        ref_result.set(None);
+        spawn_local(async move {
+            let res = invoke("verify_reference", args(serde_json::json!({ "reference": r }))).await;
+            verifying.set(false);
+            if let Ok(m) = res
+                .and_then(|v| serde_wasm_bindgen::from_value::<RefMatchWire>(v).map_err(|_| JsValue::NULL))
+            {
+                ref_result.set(Some(m));
+            }
+        });
     };
 
     let save_settings = move || {
@@ -794,18 +827,19 @@ fn App() -> impl IntoView {
             </div>
 
             <div class="modes">
-                <button
-                    class="mode" class:on=move || !check_mode.get()
-                    on:click=move |_| check_mode.set(false)
-                >"Ask"</button>
-                <button
-                    class="mode" class:on=move || check_mode.get()
-                    on:click=move |_| check_mode.set(true)
-                    title="Paste a claim and check whether these papers support it"
+                <button class="mode" class:on=move || mode.get() == "ask"
+                    on:click=move |_| mode.set("ask".into())>"Ask"</button>
+                <button class="mode" class:on=move || mode.get() == "check"
+                    on:click=move |_| mode.set("check".into())
+                    title="Paste a claim; check whether these papers support it"
                 >"Check citation"</button>
+                <button class="mode" class:on=move || mode.get() == "verify"
+                    on:click=move |_| mode.set("verify".into())
+                    title="Paste a reference; check it's a real paper (CrossRef)"
+                >"Verify reference"</button>
             </div>
 
-            {move || check_mode.get().then(|| view! {
+            {move || (mode.get() == "check").then(|| view! {
                 <select
                     class="source-select"
                     on:change=move |ev| source_key.set(event_target_value(&ev))
@@ -817,25 +851,71 @@ fn App() -> impl IntoView {
                 </select>
             })}
 
-            <div class="askrow">
-                <input
-                    class="ask"
-                    type="text"
-                    placeholder=move || if check_mode.get() {
-                        "Paste a claim to fact-check against these papers…"
+            // Ask / Check input (hidden in Verify mode).
+            {move || (mode.get() != "verify").then(|| view! {
+                <div class="askrow">
+                    <input class="ask" type="text"
+                        placeholder=move || if mode.get() == "check" {
+                            "Paste a claim to fact-check against these papers…"
+                        } else {
+                            "Ask your library."
+                        }
+                        autofocus
+                        prop:value=move || question.get()
+                        prop:disabled=move || streaming.get()
+                        on:input=move |ev| question.set(event_target_value(&ev))
+                        on:keydown=on_keydown
+                    />
+                    {move || streaming.get().then(|| view! {
+                        <button class="stop" title="Stop" on:click=move |_| cancel()>"Stop"</button>
+                    })}
+                </div>
+            })}
+
+            // Verify-reference input + CrossRef result.
+            {move || (mode.get() == "verify").then(|| view! {
+                <div class="askrow">
+                    <input class="ask" type="text"
+                        placeholder="Paste a reference (title, authors, year) to verify…"
+                        prop:value=move || ref_input.get()
+                        prop:disabled=move || verifying.get()
+                        on:input=move |ev| ref_input.set(event_target_value(&ev))
+                        on:keydown=move |ev: web_sys::KeyboardEvent| {
+                            if ev.key() == "Enter" { ev.prevent_default(); do_verify(); }
+                        }
+                    />
+                    <button class="stop" title="Verify" on:click=move |_| do_verify()>"Verify"</button>
+                </div>
+                {move || {
+                    if verifying.get() {
+                        view! { <div class="notice">"Checking CrossRef…"</div> }.into_any()
+                    } else if let Some(r) = ref_result.get() {
+                        if !r.found {
+                            view! { <div class="ref-result warn">
+                                "No match in CrossRef — this reference may be fabricated. Double-check it."
+                            </div> }.into_any()
+                        } else {
+                            let ok = r.confidence >= 55;
+                            let cls = if ok { "ref-result ok" } else { "ref-result warn" };
+                            let verdict = if ok {
+                                "Likely a real paper — matched in CrossRef".to_string()
+                            } else {
+                                format!("Weak match ({}% overlap) — CrossRef's closest paper may not be the one you cited; verify, it could be fabricated.", r.confidence)
+                            };
+                            let meta = format!(
+                                "{}  ·  {} ({})  ·  DOI {}",
+                                r.title, r.authors, r.year, r.doi
+                            );
+                            view! { <div class=cls>
+                                <b>{verdict}</b>
+                                <div class="ref-meta">{meta}</div>
+                            </div> }.into_any()
+                        }
                     } else {
-                        "Ask your library."
+                        view! { <span></span> }.into_any()
                     }
-                    autofocus
-                    prop:value=move || question.get()
-                    prop:disabled=move || streaming.get()
-                    on:input=move |ev| question.set(event_target_value(&ev))
-                    on:keydown=on_keydown
-                />
-                {move || streaming.get().then(|| view! {
-                    <button class="stop" title="Stop" on:click=move |_| cancel()>"Stop"</button>
-                })}
-            </div>
+                }}
+            })}
 
             // Current question (shown above its streaming answer).
             {move || (!asked.get().is_empty())

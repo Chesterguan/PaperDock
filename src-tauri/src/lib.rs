@@ -91,6 +91,130 @@ struct PaperRef {
     citation: String,
 }
 
+/// Closest CrossRef match for a reference — the "is this citation real?" prescreen.
+#[derive(serde::Serialize)]
+struct RefMatch {
+    found: bool,
+    /// % of the matched title's significant words present in the input reference.
+    /// High = the closest real paper matches what you cited; low = CrossRef's
+    /// best guess is unrelated, so the citation may be fabricated/mis-cited.
+    confidence: u8,
+    title: String,
+    doi: String,
+    authors: String,
+    year: String,
+}
+
+/// Fraction (0-100) of the matched title's significant words that appear in the
+/// reference the user pasted. CrossRef always returns a top hit, so this is what
+/// separates "real match" from "unrelated best-guess".
+fn title_overlap(reference: &str, title: &str) -> u8 {
+    const STOP: &[&str] = &[
+        "the", "of", "and", "for", "with", "from", "using", "via", "based",
+    ];
+    let words = |s: &str| -> std::collections::HashSet<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 2 && !STOP.contains(w))
+            .map(|w| w.to_string())
+            .collect()
+    };
+    let tw = words(title);
+    let rw = words(reference);
+    if tw.is_empty() || rw.is_empty() {
+        return 0;
+    }
+    let inter = tw.iter().filter(|w| rw.contains(*w)).count();
+    // Bidirectional: the match must both look like the title AND cover the
+    // distinctive words of the pasted reference. Taking the min rejects an
+    // adversarial fake that merely shares generic terms with a real paper.
+    let title_cov = inter * 100 / tw.len();
+    let ref_cov = inter * 100 / rw.len();
+    title_cov.min(ref_cov) as u8
+}
+
+/// Verify a reference against CrossRef (refchecker-style prescreen): is it a
+/// real published paper? Returns the closest match's metadata, or found=false.
+#[tauri::command]
+async fn verify_reference(reference: String) -> Result<RefMatch, String> {
+    let q = reference.trim();
+    if q.is_empty() {
+        return Err("Paste a reference to verify.".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .user_agent("PaperDock/0.2 (mailto:paperdock@example.com)")
+        .build()
+        .map_err(|_| "Could not start the lookup.".to_string())?;
+    let resp = client
+        .get("https://api.crossref.org/works")
+        .query(&[
+            ("query.bibliographic", q),
+            ("rows", "1"),
+            ("select", "title,DOI,author,issued"),
+        ])
+        .send()
+        .await
+        .map_err(|_| "Could not reach CrossRef — check your connection.".to_string())?;
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|_| "CrossRef returned an unexpected response.".to_string())?;
+    let Some(item) = v
+        .get("message")
+        .and_then(|m| m.get("items"))
+        .and_then(|i| i.get(0))
+    else {
+        return Ok(RefMatch {
+            found: false,
+            confidence: 0,
+            title: String::new(),
+            doi: String::new(),
+            authors: String::new(),
+            year: String::new(),
+        });
+    };
+    let title = item
+        .get("title")
+        .and_then(|t| t.get(0))
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let doi = item
+        .get("DOI")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let year = item
+        .get("issued")
+        .and_then(|i| i.get("date-parts"))
+        .and_then(|d| d.get(0))
+        .and_then(|d| d.get(0))
+        .and_then(|y| y.as_i64())
+        .map(|y| y.to_string())
+        .unwrap_or_default();
+    let authors = item
+        .get("author")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .take(3)
+                .filter_map(|au| au.get("family").and_then(|f| f.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let confidence = title_overlap(q, &title);
+    Ok(RefMatch {
+        found: !title.is_empty(),
+        confidence,
+        title,
+        doi,
+        authors,
+        year,
+    })
+}
+
 /// List the papers (with PDFs) in a collection, so Check mode can target one.
 #[tauri::command]
 async fn list_collection_papers(
@@ -549,6 +673,7 @@ pub fn run() {
             ask,
             check,
             list_collection_papers,
+            verify_reference,
             index_collection,
             cancel,
             env_status,
