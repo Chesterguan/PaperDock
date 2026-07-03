@@ -53,7 +53,7 @@ struct Collection {
 }
 
 impl Collection {
-    /// Stable id encoding library + key ("groups/6597011::ABCD1234").
+    /// Stable id encoding library + key ("groups/1234567::ABCD1234").
     fn id(&self) -> String {
         format!("{}::{}", self.library, self.key)
     }

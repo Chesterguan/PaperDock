@@ -1,14 +1,24 @@
 # PaperDock
 
+**[中文说明 → README.zh-CN.md](README.zh-CN.md)**
+
 Ask questions about your Zotero papers and get answers with citations you can
 click to open the source PDF. Runs on your Mac; your library never leaves it.
+Open source (MIT) — bring your own LLM (OpenAI, a local Ollama, or a gateway like
+UF NaviGator) and, optionally, a shared vector store.
+
+PaperDock is a **Zotero companion** — *not* a replacement for mature paper-reading
+apps. It works *around your own knowledge base* to make research faster: ask,
+fact-check claims, and vet citations against the papers you already keep in Zotero.
+(Longer term it may become a Zotero plugin — undecided. See the [roadmap](ROADMAP.md).)
 
 ---
 
 ## 1. Install
 
-1. Download **`PaperDock_0.1.0_universal.dmg`** (works on both Apple Silicon and
-   Intel Macs).
+1. Download the latest **`PaperDock_x.y.z_universal.dmg`** from
+   [Releases](https://github.com/Chesterguan/PaperDock/releases) (works on both
+   Apple Silicon and Intel Macs).
 2. Open the DMG, drag **PaperDock** into Applications.
 3. **First launch: right-click PaperDock → Open** (then click *Open* in the
    dialog). The normal double-click is blocked because the app isn't
@@ -46,10 +56,16 @@ If it returns something (even empty), the connection is on.
 
 ## 3. Use it
 
-1. Pick a **collection** from the dropdown.
-2. Type a question and press **Enter**.
-3. You get a grounded answer with **citations** — click one to open that paper
-   in Zotero. Ask follow-up questions in the same thread.
+Pick a **collection**, then choose a mode:
+
+- **Ask** — type a question, press **Enter**, get a grounded answer with
+  **citations** you can click to open the paper in Zotero. Follow-up questions
+  stay in the same thread.
+- **Check citation** — paste a *claim*; PaperDock judges whether the papers
+  support it (**SUPPORTED / PARTIALLY / NOT SUPPORTED / INSUFFICIENT EVIDENCE**)
+  with the cited evidence. Optionally target a single paper.
+- **Verify reference** — paste a *reference*; PaperDock checks it against
+  CrossRef and flags likely-fabricated citations.
 
 ---
 
@@ -132,3 +148,38 @@ Groups). Personal-library papers always embed **locally** on your own machine.
 | **"…papers have no PDF downloaded"** | Open those papers in Zotero and download/sync their PDFs, then ask again. |
 | macOS says the app **"is damaged" / can't be opened** | Right-click the app → **Open** (it's unsigned, not actually damaged). |
 | Setup screen shows an **error** | Check your internet connection and click **Try again** — first-run setup needs to download packages. |
+
+---
+
+## Build from source
+
+Needs Rust (+ the `wasm32-unknown-unknown` target), [Trunk](https://trunkrs.dev/),
+and the [Tauri CLI](https://tauri.app/). The Python side is fetched automatically
+on first run.
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install trunk
+npx @tauri-apps/cli dev      # run;  `build` for a bundle
+```
+
+## Roadmap
+
+See [ROADMAP.md](ROADMAP.md).
+
+## Contributing
+
+Issues and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). PaperDock is a
+thin native shell around [PaperQA](https://github.com/Future-House/paper-qa) for
+retrieval + answering, so most changes touch the Rust/Leptos app (`src/`,
+`src-tauri/`) or the Python sidecar (`sidecar/paperdock_worker.py`).
+
+## Credits
+
+A personal project by **Ziyuan (Chester) Guan**, built with the support of the
+**UF IC3 Center** and the **PRISMAP Lab**. Grounded by
+[PaperQA](https://github.com/Future-House/paper-qa).
+
+## License
+
+[MIT](LICENSE) © 2026 Ziyuan Guan

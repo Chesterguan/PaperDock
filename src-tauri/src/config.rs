@@ -267,20 +267,20 @@ mod tests {
             qdrant_url: Some("https://q.example".into()),
             qdrant_api_key: Some("QKEY".into()),
             api_key: Some("LLMKEY".into()),
-            default_collection: Some("groups/6597011::__all__".into()),
+            default_collection: Some("groups/1234567::__all__".into()),
         };
         cfg.apply_lab_config(&lab);
         assert_eq!(cfg.model, "openai/gpt-oss-120b");
         assert_eq!(cfg.qdrant_api_key.as_deref(), Some("QKEY"));
         assert_eq!(cfg.zotero_data_dir, dir_before); // preserved
-        assert_eq!(cfg.last_collection.as_deref(), Some("groups/6597011::__all__")); // set: was None
+        assert_eq!(cfg.last_collection.as_deref(), Some("groups/1234567::__all__")); // set: was None
     }
 
     #[test]
     fn apply_does_not_clobber_existing_collection() {
         let mut cfg = sample(); // last_collection = users/0::PERSONAL
         let lab = LabConfig {
-            default_collection: Some("groups/6597011::__all__".into()),
+            default_collection: Some("groups/1234567::__all__".into()),
             ..LabConfig::default()
         };
         cfg.apply_lab_config(&lab);
