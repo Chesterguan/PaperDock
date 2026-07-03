@@ -692,6 +692,20 @@ fn App() -> impl IntoView {
         });
     };
 
+    // Start a fresh conversation (switch topics) — so a saved note is one coherent
+    // thread, not a mix of unrelated questions.
+    let new_chat = move || {
+        history.set(Vec::new());
+        answer.set(String::new());
+        asked.set(String::new());
+        refs.set(Vec::new());
+        notice.set(String::new());
+        status.set(String::new());
+        active_source.set(0);
+        saved_link.set(String::new());
+        toast.set(String::new());
+    };
+
     let submit_draft = move || {
         let d = draft_input.get();
         let id = selected.get();
@@ -1010,6 +1024,11 @@ fn App() -> impl IntoView {
                     on:click=move |_| mode.set("draft".into())
                     title="Paste or upload a draft — PaperDock extracts every claim and batch-checks each against your papers."
                 >"Check draft"</button>
+                {move || (!answer.get().is_empty() || !history.get().is_empty()).then(|| view! {
+                    <button class="newchat"
+                        title="Start a fresh conversation — do this when you switch to a new topic, so a saved note stays one coherent thread."
+                        on:click=move |_| new_chat()>"＋ New"</button>
+                })}
             </div>
 
             {move || (mode.get() == "check").then(|| view! {
