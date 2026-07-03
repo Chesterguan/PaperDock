@@ -109,6 +109,13 @@ struct Passage {
 }
 
 #[derive(Clone, Deserialize)]
+struct SavedNote {
+    location: String,
+    is_group: bool,
+    link: String,
+}
+
+#[derive(Clone, Deserialize)]
 struct DraftItem {
     claim: String,
     verdict: String,
@@ -202,6 +209,7 @@ fn App() -> impl IntoView {
     let needs_config = RwSignal::new(false); // true when no key configured (fresh install)
     let export_key = RwSignal::new(true);    // "Include LLM key" checkbox
     let toast = RwSignal::new(String::new()); // transient confirmation
+    let saved_link = RwSignal::new(String::new()); // zotero:// link of the last saved note
 
     // ---- single "answer" event listener, wired once at startup ----------
     {
@@ -598,11 +606,11 @@ fn App() -> impl IntoView {
         });
     };
 
-    // Copy the WHOLE (contextual) conversation as a compact HTML note — Zotero
-    // notes are HTML, so it pastes in nicely. Keeps every round's question +
-    // answer (follow-ups need the context) but trims the bulky evidence to a
-    // compact source line, with a PaperDock header/footer + timestamp.
-    let copy_note = move || {
+    // Save the WHOLE (contextual) conversation as a compact HTML note directly
+    // into Zotero. Keeps every round's question + answer (follow-ups need the
+    // context) but trims the bulky evidence to a compact source line, with a
+    // PaperDock header/footer + timestamp. Goes to Zotero's open collection.
+    let save_note = move || {
         let cur = answer.get_untracked();
         let past = history.get_untracked();
         if cur.trim().is_empty() && past.is_empty() {
@@ -655,18 +663,32 @@ fn App() -> impl IntoView {
             "<hr><p><i>Captured with PaperDock · {}</i></p>",
             esc(&when)
         ));
-        plain.push_str(&format!("\n— Captured with PaperDock · {when}\n"));
-        let multi = !past.is_empty();
+        let _ = &plain; // (kept for a possible clipboard fallback; unused now)
+        saved_link.set(String::new());
+        toast.set("Saving to Zotero…".to_string());
         spawn_local(async move {
-            let _ = invoke("copy_html", args(serde_json::json!({ "html": html, "plain": plain }))).await;
-            toast.set(
-                if multi {
-                    "Copied the conversation as a note — paste into a Zotero note, Obsidian, or your draft."
-                } else {
-                    "Copied as a note — paste into a Zotero note, Obsidian, or your draft."
+            match invoke("save_to_zotero", args(serde_json::json!({ "html": html }))).await {
+                Ok(v) => {
+                    if let Ok(n) = serde_wasm_bindgen::from_value::<SavedNote>(v) {
+                        saved_link.set(n.link);
+                        toast.set(if n.is_group {
+                            format!(
+                                "Saved to Zotero → {} · a shared group; move it if you want it private.",
+                                n.location
+                            )
+                        } else {
+                            format!("Saved to Zotero → {} ✓", n.location)
+                        });
+                    } else {
+                        toast.set("Saved to Zotero.".to_string());
+                    }
                 }
-                .to_string(),
-            );
+                Err(e) => {
+                    let msg = serde_wasm_bindgen::from_value::<String>(e)
+                        .unwrap_or_else(|_| "Could not save to Zotero — is it open?".into());
+                    toast.set(msg);
+                }
+            }
         });
     };
 
@@ -780,7 +802,18 @@ fn App() -> impl IntoView {
             </header>
 
             {move || (!toast.get().is_empty()).then(|| view! {
-                <div class="toast">{toast.get()}</div>
+                <div class="toast">
+                    {move || toast.get()}
+                    {move || (!saved_link.get().is_empty()).then(|| view! {
+                        <a class="toast-link" href="#" on:click=move |ev: web_sys::MouseEvent| {
+                            ev.prevent_default();
+                            let l = saved_link.get();
+                            spawn_local(async move {
+                                let _ = invoke("open_zotero_uri", args(serde_json::json!({ "uri": l }))).await;
+                            });
+                        }>"Open in Zotero →"</a>
+                    })}
+                </div>
             })}
 
             {move || (!env_ready.get()).then(|| view! {
@@ -1163,8 +1196,8 @@ fn App() -> impl IntoView {
             </div>
 
             {move || (!answer.get().is_empty() && !streaming.get()).then(|| view! {
-                <button class="copy-note" title="Copy the whole conversation as a formatted note — paste into a Zotero note (rich text), Obsidian, or your draft"
-                    on:click=move |_| copy_note()>"⧉ Copy as note"</button>
+                <button class="copy-note" title="Save the whole conversation as a note directly into Zotero (goes to the collection you have open in Zotero)"
+                    on:click=move |_| save_note()>"⌘ Save to Zotero note"</button>
             })}
 
             <div class="refs">

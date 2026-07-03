@@ -517,6 +517,127 @@ fn copy_html(html: String, plain: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Where a note landed after saving to Zotero.
+#[derive(serde::Serialize)]
+struct SavedNote {
+    /// Library it went to (e.g. "My Library" or a group name).
+    location: String,
+    /// True if a shared group library (warn the user).
+    is_group: bool,
+    /// `zotero://select/...` link to open the note.
+    link: String,
+}
+
+/// Save an HTML note DIRECTLY into Zotero via the connector, then locate it to
+/// return where it landed + a `zotero://` link. Note: the connector saves to
+/// Zotero's currently-open collection (we can't override the target), so we
+/// report the destination and flag shared group libraries.
+#[tauri::command]
+async fn save_to_zotero(html: String) -> Result<SavedNote, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|_| "Could not start the save.".to_string())?;
+    let sid = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let save = client
+        .post("http://localhost:23119/connector/saveItems")
+        .header("X-Zotero-Connector-API-Version", "3")
+        .header("User-Agent", "PaperDock")
+        .json(&serde_json::json!({
+            "sessionID": format!("paperdock-{sid}"),
+            "items": [{ "itemType": "note", "note": html }],
+        }))
+        .send()
+        .await
+        .map_err(|_| "Zotero isn't reachable — make sure it's open.".to_string())?;
+    if !save.status().is_success() {
+        return Err("Zotero didn't accept the note.".to_string());
+    }
+    // Let Zotero persist, then find the just-created note (newest across libraries).
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+
+    // Candidate libraries: personal + each group.
+    let mut candidates: Vec<(String, String, bool)> =
+        vec![("users/0".to_string(), "My Library".to_string(), false)];
+    if let Ok(resp) = client
+        .get("http://localhost:23119/api/users/0/groups")
+        .send()
+        .await
+    {
+        if let Ok(v) = resp.json::<serde_json::Value>().await {
+            if let Some(arr) = v.as_array() {
+                for g in arr {
+                    if let (Some(id), Some(name)) = (
+                        g.get("id").and_then(|x| x.as_u64()),
+                        g.get("data")
+                            .and_then(|d| d.get("name"))
+                            .and_then(|n| n.as_str()),
+                    ) {
+                        candidates.push((format!("groups/{id}"), name.to_string(), true));
+                    }
+                }
+            }
+        }
+    }
+    // Pick the globally-newest note — that's the one we just created.
+    let mut best: Option<(String, SavedNote)> = None;
+    for (path, name, is_group) in &candidates {
+        let url = format!(
+            "http://localhost:23119/api/{path}/items?itemType=note&sort=dateAdded&direction=desc&limit=1"
+        );
+        let Ok(resp) = client.get(&url).send().await else { continue };
+        let Ok(v) = resp.json::<serde_json::Value>().await else { continue };
+        let Some(it) = v.as_array().and_then(|a| a.first()) else { continue };
+        let data = it.get("data");
+        let key = data
+            .and_then(|d| d.get("key"))
+            .and_then(|k| k.as_str())
+            .unwrap_or("");
+        let date = data
+            .and_then(|d| d.get("dateAdded"))
+            .and_then(|k| k.as_str())
+            .unwrap_or("");
+        if key.is_empty() {
+            continue;
+        }
+        let link = if *is_group {
+            let gid = path.trim_start_matches("groups/");
+            format!("zotero://select/groups/{gid}/items/{key}")
+        } else {
+            format!("zotero://select/library/items/{key}")
+        };
+        let newer = best.as_ref().map(|(d, _)| date > d.as_str()).unwrap_or(true);
+        if newer {
+            best = Some((
+                date.to_string(),
+                SavedNote {
+                    location: name.clone(),
+                    is_group: *is_group,
+                    link,
+                },
+            ));
+        }
+    }
+    best.map(|(_, n)| n)
+        .ok_or_else(|| "Saved to Zotero, but couldn't locate the note.".to_string())
+}
+
+/// Open a `zotero://` link (used to jump to a saved note).
+#[tauri::command]
+fn open_zotero_uri(uri: String) -> Result<(), String> {
+    if !uri.starts_with("zotero://") {
+        return Err("Not a Zotero link.".to_string());
+    }
+    std::process::Command::new("open")
+        .arg(uri)
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| "Could not open Zotero.".to_string())
+}
+
 /// Return the frontend-safe config (no secrets).
 #[tauri::command]
 fn get_config(state: State<'_, AppState>) -> UiConfig {
@@ -739,6 +860,8 @@ pub fn run() {
             list_collection_papers,
             verify_reference,
             copy_html,
+            save_to_zotero,
+            open_zotero_uri,
             index_collection,
             cancel,
             env_status,

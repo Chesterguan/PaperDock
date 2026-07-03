@@ -794,3 +794,5 @@ input.ask:disabled {
 }
 .draft-upload:hover { background: var(--accent-dim); border-color: var(--accent); }
 .draft-upload:disabled { opacity: .5; cursor: default; }
+
+.toast-link { margin-left: 12px; color: var(--accent); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; font-weight: 500; }
