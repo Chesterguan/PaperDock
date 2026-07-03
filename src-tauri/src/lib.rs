@@ -506,24 +506,14 @@ fn open_url(url: String) -> Result<(), String> {
         .map_err(|_| "Could not open the link.".to_string())
 }
 
-/// Copy text to the macOS clipboard (for "copy as note").
+/// Put an HTML note on the clipboard (with a plain-text fallback) so pasting into
+/// a Zotero note — which is HTML rich text — renders nicely.
 #[tauri::command]
-fn copy_text(text: String) -> Result<(), String> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-    let mut child = Command::new("pbcopy")
-        .stdin(Stdio::piped())
-        .spawn()
-        .map_err(|_| "Could not access the clipboard.".to_string())?;
-    child
-        .stdin
-        .as_mut()
-        .ok_or_else(|| "Could not access the clipboard.".to_string())?
-        .write_all(text.as_bytes())
+fn copy_html(html: String, plain: String) -> Result<(), String> {
+    let mut cb = arboard::Clipboard::new().map_err(|_| "Could not access the clipboard.".to_string())?;
+    cb.set()
+        .html(html.as_str(), Some(plain.as_str()))
         .map_err(|_| "Could not write to the clipboard.".to_string())?;
-    child
-        .wait()
-        .map_err(|_| "Clipboard copy failed.".to_string())?;
     Ok(())
 }
 
@@ -748,7 +738,7 @@ pub fn run() {
             pick_draft_file,
             list_collection_papers,
             verify_reference,
-            copy_text,
+            copy_html,
             index_collection,
             cancel,
             env_status,

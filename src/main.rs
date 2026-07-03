@@ -598,58 +598,72 @@ fn App() -> impl IntoView {
         });
     };
 
-    // Copy the WHOLE conversation (every round) + cited evidence as one clean
-    // markdown note. (Zotero's local API is read-only, so paste it into a Zotero
-    // note — or Obsidian, or your draft.)
+    // Copy the WHOLE (contextual) conversation as a compact HTML note — Zotero
+    // notes are HTML, so it pastes in nicely. Keeps every round's question +
+    // answer (follow-ups need the context) but trims the bulky evidence to a
+    // compact source line, with a PaperDock header/footer + timestamp.
     let copy_note = move || {
         let cur = answer.get_untracked();
         let past = history.get_untracked();
         if cur.trim().is_empty() && past.is_empty() {
             return;
         }
-        // Format one round (question + answer + its sources with evidence).
-        fn fmt_turn(q: &str, a: &str, refs: &[RefItem]) -> String {
-            let mut s = format!("## {}\n\n{}\n", q.trim(), a.trim());
-            if !refs.is_empty() {
-                s.push_str("\n### Sources\n");
-                for it in refs {
-                    s.push_str(&format!("- {}\n", it.citation));
-                    for p in &it.passages {
-                        let snip = p.snippet.trim();
-                        if !snip.is_empty() {
-                            let pg = if p.page.trim().is_empty() {
-                                String::new()
-                            } else {
-                                format!(" (p.{})", p.page.trim())
-                            };
-                            s.push_str(&format!("  > {snip}{pg}\n"));
-                        }
-                    }
+        fn esc(s: &str) -> String {
+            s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        }
+        fn round_html(q: &str, a: &str, refs: &[RefItem]) -> String {
+            let mut s = format!("<h3>{}</h3>", esc(q.trim()));
+            for para in a.trim().split("\n\n") {
+                let p = para.trim();
+                if !p.is_empty() {
+                    s.push_str(&format!("<p>{}</p>", esc(p)));
                 }
+            }
+            if !refs.is_empty() {
+                let cites: Vec<String> = refs.iter().map(|r| esc(&r.citation)).collect();
+                s.push_str(&format!("<p><b>Sources:</b> {}</p>", cites.join(" · ")));
             }
             s
         }
-        let mut out = String::new();
+        fn round_plain(q: &str, a: &str, refs: &[RefItem]) -> String {
+            let mut s = format!("## {}\n\n{}\n", q.trim(), a.trim());
+            if !refs.is_empty() {
+                let cites: Vec<String> = refs.iter().map(|r| r.citation.clone()).collect();
+                s.push_str(&format!("Sources: {}\n", cites.join(" · ")));
+            }
+            s
+        }
+        let when = js_sys::Date::new_0()
+            .to_locale_string("en-US", &JsValue::UNDEFINED)
+            .as_string()
+            .unwrap_or_default();
+        let mut html = String::from(
+            "<p><b>📄 PaperDock</b> — research notes</p><hr>",
+        );
+        let mut plain = String::from("# PaperDock — research notes\n\n");
         for t in &past {
-            out.push_str(&fmt_turn(&t.question, &t.answer, &t.refs));
-            out.push_str("\n---\n\n");
+            html.push_str(&round_html(&t.question, &t.answer, &t.refs));
+            plain.push_str(&round_plain(&t.question, &t.answer, &t.refs));
+            plain.push('\n');
         }
         if !cur.trim().is_empty() {
-            out.push_str(&fmt_turn(
-                &asked.get_untracked(),
-                &cur,
-                &refs.get_untracked(),
-            ));
+            let (q, r) = (asked.get_untracked(), refs.get_untracked());
+            html.push_str(&round_html(&q, &cur, &r));
+            plain.push_str(&round_plain(&q, &cur, &r));
         }
-        out.push_str("\n_via PaperDock_\n");
+        html.push_str(&format!(
+            "<hr><p><i>Captured with PaperDock · {}</i></p>",
+            esc(&when)
+        ));
+        plain.push_str(&format!("\n— Captured with PaperDock · {when}\n"));
         let multi = !past.is_empty();
         spawn_local(async move {
-            let _ = invoke("copy_text", args(serde_json::json!({ "text": out }))).await;
+            let _ = invoke("copy_html", args(serde_json::json!({ "html": html, "plain": plain }))).await;
             toast.set(
                 if multi {
-                    "Copied the whole conversation as a note — paste into Zotero, Obsidian, or your draft."
+                    "Copied the conversation as a note — paste into a Zotero note, Obsidian, or your draft."
                 } else {
-                    "Copied as a note — paste into Zotero, Obsidian, or your draft."
+                    "Copied as a note — paste into a Zotero note, Obsidian, or your draft."
                 }
                 .to_string(),
             );
@@ -948,18 +962,20 @@ fn App() -> impl IntoView {
 
             <div class="modes">
                 <button class="mode" class:on=move || mode.get() == "ask"
-                    on:click=move |_| mode.set("ask".into())>"Ask"</button>
+                    on:click=move |_| mode.set("ask".into())
+                    title="Ask a question — get a grounded answer with clickable citations. Follow-ups keep the context."
+                >"Ask"</button>
                 <button class="mode" class:on=move || mode.get() == "check"
                     on:click=move |_| mode.set("check".into())
-                    title="Paste a claim; check whether these papers support it"
+                    title="Paste a claim — PaperDock judges whether your papers support it (with evidence). Optionally target one paper."
                 >"Check citation"</button>
                 <button class="mode" class:on=move || mode.get() == "verify"
                     on:click=move |_| mode.set("verify".into())
-                    title="Paste a reference; check it's a real paper (CrossRef)"
+                    title="Paste a reference — check it's a real paper via CrossRef (catches fabricated citations)."
                 >"Verify reference"</button>
                 <button class="mode" class:on=move || mode.get() == "draft"
                     on:click=move |_| mode.set("draft".into())
-                    title="Paste a draft; batch-check its claims against these papers"
+                    title="Paste or upload a draft — PaperDock extracts every claim and batch-checks each against your papers."
                 >"Check draft"</button>
             </div>
 
@@ -1147,7 +1163,7 @@ fn App() -> impl IntoView {
             </div>
 
             {move || (!answer.get().is_empty() && !streaming.get()).then(|| view! {
-                <button class="copy-note" title="Copy this answer + evidence as a note"
+                <button class="copy-note" title="Copy the whole conversation as a formatted note — paste into a Zotero note (rich text), Obsidian, or your draft"
                     on:click=move |_| copy_note()>"⧉ Copy as note"</button>
             })}
 
