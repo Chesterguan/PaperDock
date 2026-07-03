@@ -1,0 +1,8 @@
+name = "paperdock-feedback"
+main = "worker.js"
+compatibility_date = "2024-11-01"
+
+# Fill `id` in after `wrangler kv namespace create PD_FEEDBACK` (see README.md).
+[[kv_namespaces]]
+binding = "PD_FEEDBACK"
+id = "REPLACE_WITH_KV_ID"

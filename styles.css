@@ -803,3 +803,16 @@ input.ask:disabled {
 /* embedding progress bar */
 .progress { margin-top: 10px; height: 4px; border-radius: 3px; background: var(--border); overflow: hidden; }
 .progress-fill { height: 100%; background: var(--accent); border-radius: 3px; transition: width .35s ease; }
+
+/* feedback (👍/👎) */
+.fb { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 14px; font-size: 12.5px; color: var(--text-dim); }
+.fb-q { color: var(--text-dim); }
+.fb-btn { background: transparent; border: 1px solid var(--border); border-radius: 7px; padding: 3px 10px; cursor: pointer; font-size: 14px; transition: border-color var(--t), background var(--t); }
+.fb-btn:hover { border-color: var(--accent); background: var(--accent-dim); }
+.fb-link { margin-left: auto; color: var(--text-dim); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; }
+.fb-link:hover { color: var(--accent); }
+.fb-thanks { color: var(--accent); }
+.fb-consent { flex-direction: row; }
+.fb-field { flex: 1; min-width: 160px; background: var(--surface); border: 1px solid var(--border); border-radius: 7px; padding: 6px 10px; color: var(--text); font-size: 12.5px; }
+.fb-yes { background: var(--accent-dim); border: 1px solid var(--accent); border-radius: 7px; padding: 5px 12px; color: var(--accent); cursor: pointer; }
+.fb-no { background: transparent; border: 1px solid var(--border); border-radius: 7px; padding: 5px 12px; color: var(--text-dim); cursor: pointer; }

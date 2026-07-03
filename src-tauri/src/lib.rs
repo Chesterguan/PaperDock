@@ -490,6 +490,10 @@ struct UiConfig {
     /// True if a usable key exists (env var or saved), so the UI can hide the
     /// key prompt.
     has_api_key: bool,
+    /// User's research field (feedback dimension).
+    field: String,
+    /// Feedback opt-in: null = not asked, true/false = decided.
+    tele_consent: Option<bool>,
 }
 
 /// Open an external URL in the default browser (used for the PaperQA credit).
@@ -655,7 +659,47 @@ fn get_config(state: State<'_, AppState>) -> UiConfig {
             .as_deref()
             .is_some_and(|k| !k.trim().is_empty()),
         has_api_key: has_saved || has_env,
+        field: cfg.field,
+        tele_consent: cfg.tele_consent,
     }
+}
+
+/// URL of the feedback collector (a Cloudflare Worker on *.workers.dev).
+/// Empty = telemetry disabled at build time; feedback POSTs are skipped.
+const FEEDBACK_URL: &str = "";
+
+/// Record a 👍/👎 on the last answer. Persists the user's consent + field, and
+/// (only with consent + a configured collector) POSTs a minimal, content-free
+/// event: rating, coarse field, app version. Never sends papers or questions.
+#[tauri::command]
+async fn submit_feedback(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    rating: String,
+    field: String,
+    consent: bool,
+) -> Result<(), String> {
+    {
+        let mut cfg = state.config.lock().map_err(|_| "config".to_string())?;
+        cfg.field = field.clone();
+        cfg.tele_consent = Some(consent);
+        let _ = cfg.save(&app);
+    }
+    if consent && !FEEDBACK_URL.is_empty() {
+        let body = serde_json::json!({
+            "rating": rating,
+            "field": field,
+            "version": env!("CARGO_PKG_VERSION"),
+        });
+        // Fire-and-forget; a failed send must never disrupt the user.
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(6))
+            .build()
+        {
+            let _ = client.post(FEEDBACK_URL).json(&body).send().await;
+        }
+    }
+    Ok(())
 }
 
 /// Save the LiteLLM API key entered in the UI (empty string clears it).
@@ -862,6 +906,7 @@ pub fn run() {
             copy_html,
             save_to_zotero,
             open_zotero_uri,
+            submit_feedback,
             index_collection,
             cancel,
             env_status,

@@ -74,6 +74,10 @@ struct Config {
     // True when a key (env or saved) exists, so the UI can hide the key prompt.
     #[serde(default)]
     has_api_key: bool,
+    #[serde(default)]
+    field: String,
+    #[serde(default)]
+    tele_consent: Option<bool>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -206,6 +210,13 @@ fn App() -> impl IntoView {
     let history = RwSignal::new(Vec::<Turn>::new());
     let turn_id = RwSignal::new(0usize);
     let notice = RwSignal::new(String::new()); // coverage heads-up (skipped PDFs)
+
+    // Feedback (👍/👎) — opt-in, content-free.
+    let fb_consent = RwSignal::new(None::<bool>); // None = not asked yet
+    let fb_field = RwSignal::new(String::new()); // user's research field
+    let fb_rated = RwSignal::new(false); // rated the current answer?
+    let fb_ask = RwSignal::new(false); // showing the consent prompt?
+    let fb_pending = RwSignal::new(String::new()); // rating held while asking consent
     let has_key = RwSignal::new(true); // assume present until startup says otherwise
     let key_input = RwSignal::new(String::new());
     // Settings panel (model / embedding / base URL / key).
@@ -417,6 +428,8 @@ fn App() -> impl IntoView {
                 embedding_input.set(cfg.embedding);
                 apibase_input.set(cfg.api_base);
                 qdrant_url_input.set(cfg.qdrant_url);
+                fb_consent.set(cfg.tele_consent);
+                fb_field.set(cfg.field);
                 // First run with no key configured: show the "connect to your
                 // lab" gate (import a .paperdock config, or set up manually).
                 if !cfg.has_api_key {
@@ -564,6 +577,8 @@ fn App() -> impl IntoView {
         refs.set(Vec::new());
         active_source.set(0);
         notice.set(String::new());
+        fb_rated.set(false);
+        fb_ask.set(false);
         streaming.set(true);
         status.set("Indexing…".to_string());
         let checking = mode.get_untracked() == "check";
@@ -721,6 +736,34 @@ fn App() -> impl IntoView {
         active_source.set(0);
         saved_link.set(String::new());
         toast.set(String::new());
+        fb_rated.set(false);
+        fb_ask.set(false);
+    };
+
+    // 👍/👎 on the current answer. First time asks consent + field; after that it
+    // just records (and sends only if the user opted in).
+    let send_rating = move |rating: String, consent: bool| {
+        let field = fb_field.get_untracked();
+        fb_rated.set(true);
+        spawn_local(async move {
+            let _ = invoke(
+                "submit_feedback",
+                args(serde_json::json!({ "rating": rating, "field": field, "consent": consent })),
+            )
+            .await;
+        });
+    };
+    let rate = move |r: String| match fb_consent.get_untracked() {
+        None => {
+            fb_pending.set(r);
+            fb_ask.set(true);
+        }
+        Some(consent) => send_rating(r, consent),
+    };
+    let decide_consent = move |allow: bool| {
+        fb_consent.set(Some(allow));
+        fb_ask.set(false);
+        send_rating(fb_pending.get_untracked(), allow);
     };
 
     let submit_draft = move || {
@@ -1239,6 +1282,36 @@ fn App() -> impl IntoView {
             {move || (!answer.get().is_empty() && !streaming.get()).then(|| view! {
                 <button class="copy-note" title="Save the whole conversation as a note directly into Zotero (goes to the collection you have open in Zotero)"
                     on:click=move |_| save_note()>"⌘ Save to Zotero note"</button>
+            })}
+
+            {move || (!answer.get().is_empty() && !streaming.get()).then(|| {
+                if fb_rated.get() {
+                    view! { <div class="fb"><span class="fb-thanks">"Thanks — noted."</span></div> }.into_any()
+                } else if fb_ask.get() {
+                    view! { <div class="fb fb-consent">
+                        <span>"Send anonymous feedback to help improve PaperDock? Only your rating + research field — never your papers or questions."</span>
+                        <input class="fb-field" placeholder="Your field (e.g. clinical ML)"
+                            prop:value=move || fb_field.get()
+                            on:input=move |ev| fb_field.set(event_target_value(&ev)) />
+                        <button class="fb-yes" on:click=move |_| decide_consent(true)>"Allow & send"</button>
+                        <button class="fb-no" on:click=move |_| decide_consent(false)>"No thanks"</button>
+                    </div> }.into_any()
+                } else {
+                    view! { <div class="fb">
+                        <span class="fb-q">"Was this helpful?"</span>
+                        <button class="fb-btn" title="Helpful" on:click=move |_| rate("up".to_string())>"👍"</button>
+                        <button class="fb-btn" title="Not helpful" on:click=move |_| rate("down".to_string())>"👎"</button>
+                        <a class="fb-link" href="#" title="Open a GitHub issue"
+                            on:click=move |ev: web_sys::MouseEvent| {
+                                ev.prevent_default();
+                                spawn_local(async move {
+                                    let _ = invoke("open_url", args(serde_json::json!({
+                                        "url": "https://github.com/Chesterguan/PaperDock/issues/new"
+                                    }))).await;
+                                });
+                            }>"Send detailed feedback →"</a>
+                    </div> }.into_any()
+                }
             })}
 
             <div class="refs">
