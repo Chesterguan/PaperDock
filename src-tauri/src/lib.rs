@@ -61,8 +61,184 @@ async fn ask(
         collection_key,
         question,
         history.unwrap_or_default(),
+        None,
     )
     .await
+}
+
+/// Citation-check: judge whether the collection's papers support a claim.
+/// Reuses the whole embed/retrieve pipeline with a verdict prompt (worker
+/// swaps the answer prompt when `cmd == "check"`). `claim` rides the `question`
+/// slot; no conversation history.
+#[tauri::command]
+async fn check(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    library: String,
+    collection_key: String,
+    claim: String,
+    #[allow(non_snake_case)] source_key: Option<String>,
+) -> Result<(), String> {
+    let sk = source_key.filter(|s| !s.is_empty());
+    spawn_worker(app, state, "check", library, collection_key, claim, String::new(), sk).await
+}
+
+/// One checkable paper (has a PDF) in a collection — for the citation-check
+/// source picker.
+#[derive(serde::Serialize)]
+struct PaperRef {
+    key: String,
+    citation: String,
+}
+
+/// Closest CrossRef match for a reference — the "is this citation real?" prescreen.
+#[derive(serde::Serialize)]
+struct RefMatch {
+    found: bool,
+    /// % of the matched title's significant words present in the input reference.
+    /// High = the closest real paper matches what you cited; low = CrossRef's
+    /// best guess is unrelated, so the citation may be fabricated/mis-cited.
+    confidence: u8,
+    title: String,
+    doi: String,
+    authors: String,
+    year: String,
+}
+
+/// Fraction (0-100) of the matched title's significant words that appear in the
+/// reference the user pasted. CrossRef always returns a top hit, so this is what
+/// separates "real match" from "unrelated best-guess".
+fn title_overlap(reference: &str, title: &str) -> u8 {
+    const STOP: &[&str] = &[
+        "the", "of", "and", "for", "with", "from", "using", "via", "based",
+    ];
+    let words = |s: &str| -> std::collections::HashSet<String> {
+        s.to_lowercase()
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| w.len() > 2 && !STOP.contains(w))
+            .map(|w| w.to_string())
+            .collect()
+    };
+    let tw = words(title);
+    let rw = words(reference);
+    if tw.is_empty() || rw.is_empty() {
+        return 0;
+    }
+    let inter = tw.iter().filter(|w| rw.contains(*w)).count();
+    // Bidirectional: the match must both look like the title AND cover the
+    // distinctive words of the pasted reference. Taking the min rejects an
+    // adversarial fake that merely shares generic terms with a real paper.
+    let title_cov = inter * 100 / tw.len();
+    let ref_cov = inter * 100 / rw.len();
+    title_cov.min(ref_cov) as u8
+}
+
+/// Verify a reference against CrossRef (refchecker-style prescreen): is it a
+/// real published paper? Returns the closest match's metadata, or found=false.
+#[tauri::command]
+async fn verify_reference(reference: String) -> Result<RefMatch, String> {
+    let q = reference.trim();
+    if q.is_empty() {
+        return Err("Paste a reference to verify.".to_string());
+    }
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(12))
+        .user_agent("PaperDock/0.2 (mailto:paperdock@example.com)")
+        .build()
+        .map_err(|_| "Could not start the lookup.".to_string())?;
+    let resp = client
+        .get("https://api.crossref.org/works")
+        .query(&[
+            ("query.bibliographic", q),
+            ("rows", "1"),
+            ("select", "title,DOI,author,issued"),
+        ])
+        .send()
+        .await
+        .map_err(|_| "Could not reach CrossRef — check your connection.".to_string())?;
+    let v: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|_| "CrossRef returned an unexpected response.".to_string())?;
+    let Some(item) = v
+        .get("message")
+        .and_then(|m| m.get("items"))
+        .and_then(|i| i.get(0))
+    else {
+        return Ok(RefMatch {
+            found: false,
+            confidence: 0,
+            title: String::new(),
+            doi: String::new(),
+            authors: String::new(),
+            year: String::new(),
+        });
+    };
+    let title = item
+        .get("title")
+        .and_then(|t| t.get(0))
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let doi = item
+        .get("DOI")
+        .and_then(|s| s.as_str())
+        .unwrap_or("")
+        .to_string();
+    let year = item
+        .get("issued")
+        .and_then(|i| i.get("date-parts"))
+        .and_then(|d| d.get(0))
+        .and_then(|d| d.get(0))
+        .and_then(|y| y.as_i64())
+        .map(|y| y.to_string())
+        .unwrap_or_default();
+    let authors = item
+        .get("author")
+        .and_then(|a| a.as_array())
+        .map(|arr| {
+            arr.iter()
+                .take(3)
+                .filter_map(|au| au.get("family").and_then(|f| f.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let confidence = title_overlap(q, &title);
+    Ok(RefMatch {
+        found: !title.is_empty(),
+        confidence,
+        title,
+        doi,
+        authors,
+        year,
+    })
+}
+
+/// List the papers (with PDFs) in a collection, so Check mode can target one.
+#[tauri::command]
+async fn list_collection_papers(
+    state: State<'_, AppState>,
+    library: String,
+    collection_key: String,
+) -> Result<Vec<PaperRef>, String> {
+    let data_dir = {
+        state
+            .config
+            .lock()
+            .map_err(|_| "Config is unavailable.".to_string())?
+            .zotero_data_dir
+            .clone()
+    };
+    let resolved = zotero::collection_docs(&library, &collection_key, &data_dir).await?;
+    Ok(resolved
+        .docs
+        .into_iter()
+        .map(|d| PaperRef {
+            key: d.zotero_key,
+            citation: d.citation,
+        })
+        .collect())
 }
 
 /// Pre-embed a collection into the shared index (no LLM query), so later asks
@@ -82,6 +258,7 @@ async fn index_collection(
         collection_key,
         String::new(),
         String::new(),
+        None,
     )
     .await
 }
@@ -97,6 +274,7 @@ async fn spawn_worker(
     collection_key: String,
     question: String,
     history: String,
+    source_key: Option<String>,
 ) -> Result<(), String> {
     // Snapshot the config values we need without holding the lock across await.
     let (model, embedding, api_base, data_dir, api_key, qdrant_url, qdrant_key) = {
@@ -116,8 +294,13 @@ async fn spawn_worker(
     };
 
     let resolved = zotero::collection_docs(&library, &collection_key, &data_dir).await?;
-    let docs: Vec<DocRef> = resolved.docs;
+    let mut docs: Vec<DocRef> = resolved.docs;
     let skipped = resolved.skipped;
+    // Citation-check may target ONE paper (the specific cited source) instead of
+    // the whole collection.
+    if let Some(sk) = &source_key {
+        docs.retain(|d| &d.zotero_key == sk);
+    }
 
     // Scope the shared Qdrant index per library+collection so group and
     // personal collections with the same key never collide.
@@ -376,6 +559,79 @@ fn set_last_collection(
     cfg.save(&app)
 }
 
+/// Read a `.paperdock` file, merge it into the live config, persist, and tell
+/// the UI. Returns the lab's display name. Never leaks a raw parse error.
+fn apply_lab_file(app: &tauri::AppHandle, path: &std::path::Path) -> Result<String, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|_| "Could not read that lab config file.".to_string())?;
+    let lab: config::LabConfig = serde_json::from_str(&raw)
+        .map_err(|_| "That doesn't look like a PaperDock lab config file.".to_string())?;
+    let name = lab.summary_name();
+    let saved = {
+        let state = app.state::<AppState>();
+        let mut guard = state
+            .config
+            .lock()
+            .map_err(|_| "Config is unavailable.".to_string())?;
+        guard.apply_lab_config(&lab);
+        guard.clone()
+    };
+    saved.save(app)?;
+    let _ = app.emit("lab-imported", name.clone());
+    Ok(name)
+}
+
+/// Export the shared config as a `.paperdock` file the admin distributes.
+/// Opens a save dialog; returns the written path, or "" if cancelled.
+#[tauri::command]
+async fn export_lab_config(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    include_key: bool,
+) -> Result<String, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let lab = {
+        let cfg = state
+            .config
+            .lock()
+            .map_err(|_| "Config is unavailable.".to_string())?;
+        cfg.to_lab_config(include_key)
+    };
+    let json = serde_json::to_string_pretty(&lab)
+        .map_err(|_| "Could not build the lab config.".to_string())?;
+    let file = app
+        .dialog()
+        .file()
+        .add_filter("PaperDock lab config", &["paperdock"])
+        .set_file_name("lab.paperdock")
+        .blocking_save_file();
+    let Some(file) = file else { return Ok(String::new()) };
+    let path = file
+        .into_path()
+        .map_err(|_| "Could not resolve the save path.".to_string())?;
+    std::fs::write(&path, json).map_err(|_| "Could not write the file.".to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+/// Import a `.paperdock` file chosen via an open dialog. Returns the lab name.
+#[tauri::command]
+async fn import_lab_config(
+    app: tauri::AppHandle,
+    _state: State<'_, AppState>,
+) -> Result<String, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let file = app
+        .dialog()
+        .file()
+        .add_filter("PaperDock lab config", &["paperdock"])
+        .blocking_pick_file();
+    let Some(file) = file else { return Ok(String::new()) };
+    let path = file
+        .into_path()
+        .map_err(|_| "Could not resolve the file path.".to_string())?;
+    apply_lab_file(&app, &path)
+}
+
 // ----- Setup helpers -------------------------------------------------------
 
 /// Resolve the sidecar worker path, trying dev-relative locations first, then
@@ -399,6 +655,7 @@ fn resolve_worker_path(app: &tauri::AppHandle) -> String {
 /// Build, configure, and run the Tauri application.
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let handle = app.handle();
             let worker_path = resolve_worker_path(handle);
@@ -414,6 +671,9 @@ pub fn run() {
             zotero_status,
             list_collections,
             ask,
+            check,
+            list_collection_papers,
+            verify_reference,
             index_collection,
             cancel,
             env_status,
@@ -424,7 +684,21 @@ pub fn run() {
             set_last_collection,
             set_api_key,
             set_settings,
+            export_lab_config,
+            import_lab_config,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running PaperDock");
+        .build(tauri::generate_context!())
+        .expect("error while building PaperDock")
+        .run(|app, event| {
+            if let tauri::RunEvent::Opened { urls } = event {
+                for url in urls {
+                    // macOS delivers file:// URLs for associated files.
+                    if let Ok(path) = url.to_file_path() {
+                        if path.extension().and_then(|e| e.to_str()) == Some("paperdock") {
+                            let _ = apply_lab_file(app, &path);
+                        }
+                    }
+                }
+            }
+        });
 }

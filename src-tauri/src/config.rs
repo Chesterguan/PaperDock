@@ -126,6 +126,50 @@ impl Config {
             .map_err(|e| format!("Could not serialize config: {e}"))?;
         fs::write(&path, json).map_err(|e| format!("Could not write config: {e}"))
     }
+
+    /// Build a shareable LabConfig from the current config. `include_key`
+    /// controls whether the LLM api_key travels (labs using personal keys omit).
+    pub fn to_lab_config(&self, include_key: bool) -> LabConfig {
+        LabConfig {
+            lab_name: None,
+            model: Some(self.model.clone()),
+            embedding: Some(self.embedding.clone()),
+            api_base: self.api_base.clone(),
+            qdrant_url: self.qdrant_url.clone(),
+            qdrant_api_key: self.qdrant_api_key.clone(),
+            api_key: if include_key { self.api_key.clone() } else { None },
+            default_collection: None,
+        }
+    }
+
+    /// Merge a lab config into this config: overwrite each shared field only
+    /// when the lab file provides it; preserve zotero_data_dir always; set
+    /// last_collection from default_collection only if none is set yet.
+    pub fn apply_lab_config(&mut self, lab: &LabConfig) {
+        if let Some(m) = &lab.model {
+            self.model = m.clone();
+        }
+        if let Some(e) = &lab.embedding {
+            self.embedding = e.clone();
+        }
+        if lab.api_base.is_some() {
+            self.api_base = lab.api_base.clone();
+        }
+        if lab.qdrant_url.is_some() {
+            self.qdrant_url = lab.qdrant_url.clone();
+        }
+        if lab.qdrant_api_key.is_some() {
+            self.qdrant_api_key = lab.qdrant_api_key.clone();
+        }
+        if lab.api_key.is_some() {
+            self.api_key = lab.api_key.clone();
+        }
+        if self.last_collection.is_none() {
+            if let Some(dc) = &lab.default_collection {
+                self.last_collection = Some(dc.clone());
+            }
+        }
+    }
 }
 
 fn config_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -136,10 +180,110 @@ fn config_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     Ok(dir.join("config.json"))
 }
 
+/// The SHARED subset of config an admin distributes to members as a
+/// `.paperdock` file. Per-machine fields (zotero_data_dir, personal
+/// last_collection) never travel. `api_key` is optional so a lab can require
+/// members to use their own.
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct LabConfig {
+    #[serde(default)]
+    pub lab_name: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub embedding: Option<String>,
+    #[serde(default)]
+    pub api_base: Option<String>,
+    #[serde(default)]
+    pub qdrant_url: Option<String>,
+    #[serde(default)]
+    pub qdrant_api_key: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub default_collection: Option<String>,
+}
+
+impl LabConfig {
+    pub fn summary_name(&self) -> String {
+        self.lab_name
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "your lab".to_string())
+    }
+}
+
 /// Default Zotero data dir: `~/Zotero`.
 pub fn default_zotero_dir() -> String {
     dirs::home_dir()
         .map(|h| h.join("Zotero"))
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| "Zotero".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample() -> Config {
+        Config {
+            last_collection: Some("users/0::PERSONAL".into()),
+            zotero_data_dir: "/Users/me/Zotero".into(),
+            model: "openai/gpt-oss-120b".into(),
+            embedding: "openai/nomic".into(),
+            api_base: Some("https://api.ai.it.ufl.edu/v1".into()),
+            qdrant_url: Some("https://q.example".into()),
+            qdrant_api_key: Some("QKEY".into()),
+            api_key: Some("LLMKEY".into()),
+        }
+    }
+
+    #[test]
+    fn to_lab_config_includes_key_when_asked() {
+        let lab = sample().to_lab_config(true);
+        assert_eq!(lab.api_key.as_deref(), Some("LLMKEY"));
+        assert_eq!(lab.qdrant_api_key.as_deref(), Some("QKEY"));
+        assert_eq!(lab.model.as_deref(), Some("openai/gpt-oss-120b"));
+        // Per-machine fields never travel.
+        assert!(lab.default_collection.is_none());
+    }
+
+    #[test]
+    fn to_lab_config_omits_key_when_not_asked() {
+        let lab = sample().to_lab_config(false);
+        assert!(lab.api_key.is_none());
+        assert_eq!(lab.qdrant_api_key.as_deref(), Some("QKEY")); // shared, still travels
+    }
+
+    #[test]
+    fn apply_overwrites_shared_preserves_local() {
+        let mut cfg = Config::default(); // zotero_data_dir = default, last_collection None
+        let dir_before = cfg.zotero_data_dir.clone();
+        let lab = LabConfig {
+            lab_name: Some("Smith Lab".into()),
+            model: Some("openai/gpt-oss-120b".into()),
+            embedding: Some("openai/nomic".into()),
+            api_base: Some("https://api.ai.it.ufl.edu/v1".into()),
+            qdrant_url: Some("https://q.example".into()),
+            qdrant_api_key: Some("QKEY".into()),
+            api_key: Some("LLMKEY".into()),
+            default_collection: Some("groups/6597011::__all__".into()),
+        };
+        cfg.apply_lab_config(&lab);
+        assert_eq!(cfg.model, "openai/gpt-oss-120b");
+        assert_eq!(cfg.qdrant_api_key.as_deref(), Some("QKEY"));
+        assert_eq!(cfg.zotero_data_dir, dir_before); // preserved
+        assert_eq!(cfg.last_collection.as_deref(), Some("groups/6597011::__all__")); // set: was None
+    }
+
+    #[test]
+    fn apply_does_not_clobber_existing_collection() {
+        let mut cfg = sample(); // last_collection = users/0::PERSONAL
+        let lab = LabConfig {
+            default_collection: Some("groups/6597011::__all__".into()),
+            ..LabConfig::default()
+        };
+        cfg.apply_lab_config(&lab);
+        assert_eq!(cfg.last_collection.as_deref(), Some("users/0::PERSONAL")); // kept
+    }
 }

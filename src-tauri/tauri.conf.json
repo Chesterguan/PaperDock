@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "PaperDock",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.paperdock.app",
   "build": {
     "beforeDevCommand": "trunk serve",
@@ -28,11 +28,17 @@
     "active": true,
     "targets": ["app", "dmg"],
     "resources": {
-      "team_config.json": "team_config.json",
       "bin/uv": "bin/uv",
       "../sidecar/paperdock_worker.py": "paperdock_worker.py",
       "../sidecar/requirements.lock": "requirements.lock"
     },
+    "fileAssociations": [
+      {
+        "ext": ["paperdock"],
+        "name": "PaperDock Lab Config",
+        "role": "Editor"
+      }
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

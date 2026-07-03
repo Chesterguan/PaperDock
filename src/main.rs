@@ -77,6 +77,22 @@ struct Config {
 }
 
 #[derive(Clone, Deserialize)]
+struct PaperRef {
+    key: String,
+    citation: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct RefMatchWire {
+    found: bool,
+    confidence: u8,
+    title: String,
+    doi: String,
+    authors: String,
+    year: String,
+}
+
+#[derive(Clone, Deserialize)]
 struct RefItem {
     item_key: String,
     citation: String,
@@ -139,6 +155,13 @@ fn App() -> impl IntoView {
     let refs = RwSignal::new(Vec::<RefItem>::new());
     let active_source = RwSignal::new(0usize); // which Sources tab is open
     let streaming = RwSignal::new(false);
+    let mode = RwSignal::new("ask".to_string()); // "ask" | "check" | "verify"
+    let papers = RwSignal::new(Vec::<PaperRef>::new()); // collection's papers (check mode)
+    let source_key = RwSignal::new(String::new()); // "" = all papers, else one paper's key
+    // Verify-reference (CrossRef prescreen) state.
+    let ref_input = RwSignal::new(String::new());
+    let ref_result = RwSignal::new(Option::<RefMatchWire>::None);
+    let verifying = RwSignal::new(false);
     // Conversation thread: `asked` is the current in-progress question; `history`
     // holds completed turns above it.
     let asked = RwSignal::new(String::new());
@@ -162,6 +185,9 @@ fn App() -> impl IntoView {
     let tip_idx = RwSignal::new(0usize); // rotates the "get ready" tips
     let remembered = RwSignal::new(Option::<String>::None); // last collection to preselect
     let collections_ready = RwSignal::new(false); // collections have been fetched at least once
+    let needs_config = RwSignal::new(false); // true when no key configured (fresh install)
+    let export_key = RwSignal::new(true);    // "Include LLM key" checkbox
+    let toast = RwSignal::new(String::new()); // transient confirmation
 
     // ---- single "answer" event listener, wired once at startup ----------
     {
@@ -247,6 +273,54 @@ fn App() -> impl IntoView {
             cb.forget();
         });
     }
+
+    // ---- lab config import: "lab-imported" event (double-click or manual) --
+    {
+        let cb = Closure::<dyn FnMut(JsValue)>::new(move |ev: JsValue| {
+            let payload = js_sys::Reflect::get(&ev, &JsValue::from_str("payload"))
+                .unwrap_or(JsValue::NULL);
+            let name = payload.as_string().unwrap_or_default();
+            let keyed_toast = if name.is_empty() {
+                "Lab config imported ✓".to_string()
+            } else {
+                format!("Lab config imported ✓ ({name})")
+            };
+            // The shared config was applied either way, so the first-run gate
+            // is done — but whether the member still needs their own key
+            // depends on the real backend state, not a blind assumption. An
+            // admin can export without the LLM key (README tells members to
+            // add their own), so re-read `get_config` and set state from the
+            // fresh values, same as startup does.
+            spawn_local(async move {
+                needs_config.set(false);
+                if let Ok(v) = invoke("get_config", args(serde_json::json!({}))).await {
+                    if let Ok(cfg) = serde_wasm_bindgen::from_value::<Config>(v) {
+                        has_key.set(cfg.has_api_key);
+                        model_input.set(cfg.model);
+                        embedding_input.set(cfg.embedding);
+                        apibase_input.set(cfg.api_base);
+                        qdrant_url_input.set(cfg.qdrant_url);
+                        if cfg.has_api_key {
+                            show_settings.set(false);
+                            toast.set(keyed_toast);
+                        } else {
+                            // Keyless import: prompt the member to add their own key.
+                            show_settings.set(true);
+                            toast.set("Lab config imported ✓ — add your API key in Settings".to_string());
+                        }
+                        return;
+                    }
+                }
+                // get_config failed or didn't parse — fall back to the
+                // pre-verification toast rather than silently claiming success.
+                toast.set(keyed_toast);
+            });
+        });
+        spawn_local(async move {
+            let _ = listen("lab-imported", cb.as_ref()).await;
+            cb.forget();
+        });
+    }
     spawn_local(async move {
         // If the reading environment isn't provisioned yet, the setup screen
         // shows. Assume ready on any hiccup so we never block a working dev app.
@@ -297,10 +371,10 @@ fn App() -> impl IntoView {
                 embedding_input.set(cfg.embedding);
                 apibase_input.set(cfg.api_base);
                 qdrant_url_input.set(cfg.qdrant_url);
-                // First run with no key configured: open Settings so the user
-                // can add a key or point at a local (Ollama) model.
+                // First run with no key configured: show the "connect to your
+                // lab" gate (import a .paperdock config, or set up manually).
                 if !cfg.has_api_key {
-                    show_settings.set(true);
+                    needs_config.set(true);
                 }
             }
         }
@@ -376,6 +450,32 @@ fn App() -> impl IntoView {
         index();
     };
 
+    // In Check mode, load the collection's papers so the user can target one.
+    Effect::new(move |_| {
+        if mode.get() != "check" {
+            return;
+        }
+        let id = selected.get();
+        if id.is_empty() {
+            return;
+        }
+        let (library, key) = id.split_once("::").unwrap_or(("users/0", id.as_str()));
+        let (library, key) = (library.to_string(), key.to_string());
+        source_key.set(String::new());
+        spawn_local(async move {
+            if let Ok(v) = invoke(
+                "list_collection_papers",
+                args(serde_json::json!({ "library": library, "collectionKey": key })),
+            )
+            .await
+            {
+                if let Ok(list) = serde_wasm_bindgen::from_value::<Vec<PaperRef>>(v) {
+                    papers.set(list);
+                }
+            }
+        });
+    });
+
     let submit = move || {
         let q = question.get();
         let id = selected.get();
@@ -420,15 +520,28 @@ fn App() -> impl IntoView {
         notice.set(String::new());
         streaming.set(true);
         status.set("Indexing…".to_string());
+        let checking = mode.get_untracked() == "check";
         spawn_local(async move {
-            let res = invoke(
-                "ask",
-                args(serde_json::json!({
-                    "library": library, "collectionKey": key, "question": q,
-                    "history": hist_text,
-                })),
-            )
-            .await;
+            let res = if checking {
+                // Citation-check: `q` is a claim; no conversation history.
+                invoke(
+                    "check",
+                    args(serde_json::json!({
+                        "library": library, "collectionKey": key, "claim": q,
+                        "sourceKey": source_key.get_untracked(),
+                    })),
+                )
+                .await
+            } else {
+                invoke(
+                    "ask",
+                    args(serde_json::json!({
+                        "library": library, "collectionKey": key, "question": q,
+                        "history": hist_text,
+                    })),
+                )
+                .await
+            };
             if let Err(e) = res {
                 streaming.set(false);
                 let msg = serde_wasm_bindgen::from_value::<String>(e)
@@ -443,6 +556,25 @@ fn App() -> impl IntoView {
             ev.prevent_default();
             submit();
         }
+    };
+
+    // Verify-reference (CrossRef prescreen): a direct command, not the worker.
+    let do_verify = move || {
+        let r = ref_input.get();
+        if r.trim().is_empty() || verifying.get() {
+            return;
+        }
+        verifying.set(true);
+        ref_result.set(None);
+        spawn_local(async move {
+            let res = invoke("verify_reference", args(serde_json::json!({ "reference": r }))).await;
+            verifying.set(false);
+            if let Ok(m) = res
+                .and_then(|v| serde_wasm_bindgen::from_value::<RefMatchWire>(v).map_err(|_| JsValue::NULL))
+            {
+                ref_result.set(Some(m));
+            }
+        });
     };
 
     let save_settings = move || {
@@ -513,6 +645,10 @@ fn App() -> impl IntoView {
                 </button>
             </header>
 
+            {move || (!toast.get().is_empty()).then(|| view! {
+                <div class="toast">{toast.get()}</div>
+            })}
+
             {move || (!env_ready.get()).then(|| view! {
                 <div class="setup-overlay">
                     <div class="setup-card">
@@ -567,6 +703,29 @@ fn App() -> impl IntoView {
                 </div>
             })}
 
+            {move || (env_ready.get() && needs_config.get()).then(|| view! {
+                <div class="setup-overlay">
+                    <div class="setup-card">
+                        <h2>"Connect to your lab"</h2>
+                        <p class="setup-lead">
+                            "Your lab admin sent you a "<b>".paperdock"</b>" config file. "
+                            "Double-click it to set up PaperDock, or import it here."
+                        </p>
+                        <button class="ask" on:click=move |_| {
+                            spawn_local(async move {
+                                let _ = invoke("import_lab_config", args(serde_json::json!({}))).await;
+                            });
+                        }>"Import lab config…"</button>
+                        <p class="setup-hint">
+                            "No file yet? Ask your admin, or "
+                            <a href="#" on:click=move |_| { needs_config.set(false); show_settings.set(true); }>
+                                "set it up manually"
+                            </a>"."
+                        </p>
+                    </div>
+                </div>
+            })}
+
             {move || show_settings.get().then(|| view! {
                 <div class="settings">
                     <label class="slabel">"Chat model"</label>
@@ -594,6 +753,23 @@ fn App() -> impl IntoView {
                         placeholder="•••"
                         on:input=move |ev| qdrant_key_input.set(event_target_value(&ev)) />
                     <button class="keysave" on:click=move |_| save_settings()>"Save"</button>
+
+                    <div class="lab-export">
+                        <label class="lab-export-row">
+                            <input type="checkbox"
+                                prop:checked=move || export_key.get()
+                                on:change=move |ev| export_key.set(event_target_checked(&ev)) />
+                            "Include LLM key (uncheck so members use their own)"
+                        </label>
+                        <button class="ask" on:click=move |_| {
+                            let inc = export_key.get();
+                            spawn_local(async move {
+                                let _ = invoke("export_lab_config",
+                                    args(serde_json::json!({ "includeKey": inc }))).await;
+                            });
+                        }>"Export lab config…"</button>
+                        <p class="setup-hint">"This file contains your keys — share it privately."</p>
+                    </div>
                 </div>
             })}
 
@@ -650,21 +826,96 @@ fn App() -> impl IntoView {
                 }}
             </div>
 
-            <div class="askrow">
-                <input
-                    class="ask"
-                    type="text"
-                    placeholder="Ask your library."
-                    autofocus
-                    prop:value=move || question.get()
-                    prop:disabled=move || streaming.get()
-                    on:input=move |ev| question.set(event_target_value(&ev))
-                    on:keydown=on_keydown
-                />
-                {move || streaming.get().then(|| view! {
-                    <button class="stop" title="Stop" on:click=move |_| cancel()>"Stop"</button>
-                })}
+            <div class="modes">
+                <button class="mode" class:on=move || mode.get() == "ask"
+                    on:click=move |_| mode.set("ask".into())>"Ask"</button>
+                <button class="mode" class:on=move || mode.get() == "check"
+                    on:click=move |_| mode.set("check".into())
+                    title="Paste a claim; check whether these papers support it"
+                >"Check citation"</button>
+                <button class="mode" class:on=move || mode.get() == "verify"
+                    on:click=move |_| mode.set("verify".into())
+                    title="Paste a reference; check it's a real paper (CrossRef)"
+                >"Verify reference"</button>
             </div>
+
+            {move || (mode.get() == "check").then(|| view! {
+                <select
+                    class="source-select"
+                    on:change=move |ev| source_key.set(event_target_value(&ev))
+                >
+                    <option value="">"All papers in the collection"</option>
+                    {move || papers.get().into_iter().map(|p| view! {
+                        <option value=p.key>{p.citation}</option>
+                    }).collect::<Vec<_>>()}
+                </select>
+            })}
+
+            // Ask / Check input (hidden in Verify mode).
+            {move || (mode.get() != "verify").then(|| view! {
+                <div class="askrow">
+                    <input class="ask" type="text"
+                        placeholder=move || if mode.get() == "check" {
+                            "Paste a claim to fact-check against these papers…"
+                        } else {
+                            "Ask your library."
+                        }
+                        autofocus
+                        prop:value=move || question.get()
+                        prop:disabled=move || streaming.get()
+                        on:input=move |ev| question.set(event_target_value(&ev))
+                        on:keydown=on_keydown
+                    />
+                    {move || streaming.get().then(|| view! {
+                        <button class="stop" title="Stop" on:click=move |_| cancel()>"Stop"</button>
+                    })}
+                </div>
+            })}
+
+            // Verify-reference input + CrossRef result.
+            {move || (mode.get() == "verify").then(|| view! {
+                <div class="askrow">
+                    <input class="ask" type="text"
+                        placeholder="Paste a reference (title, authors, year) to verify…"
+                        prop:value=move || ref_input.get()
+                        prop:disabled=move || verifying.get()
+                        on:input=move |ev| ref_input.set(event_target_value(&ev))
+                        on:keydown=move |ev: web_sys::KeyboardEvent| {
+                            if ev.key() == "Enter" { ev.prevent_default(); do_verify(); }
+                        }
+                    />
+                    <button class="stop" title="Verify" on:click=move |_| do_verify()>"Verify"</button>
+                </div>
+                {move || {
+                    if verifying.get() {
+                        view! { <div class="notice">"Checking CrossRef…"</div> }.into_any()
+                    } else if let Some(r) = ref_result.get() {
+                        if !r.found {
+                            view! { <div class="ref-result warn">
+                                "No match in CrossRef — this reference may be fabricated. Double-check it."
+                            </div> }.into_any()
+                        } else {
+                            let ok = r.confidence >= 55;
+                            let cls = if ok { "ref-result ok" } else { "ref-result warn" };
+                            let verdict = if ok {
+                                "Likely a real paper — matched in CrossRef".to_string()
+                            } else {
+                                format!("Weak match ({}% overlap) — CrossRef's closest paper may not be the one you cited; verify, it could be fabricated.", r.confidence)
+                            };
+                            let meta = format!(
+                                "{}  ·  {} ({})  ·  DOI {}",
+                                r.title, r.authors, r.year, r.doi
+                            );
+                            view! { <div class=cls>
+                                <b>{verdict}</b>
+                                <div class="ref-meta">{meta}</div>
+                            </div> }.into_any()
+                        }
+                    } else {
+                        view! { <span></span> }.into_any()
+                    }
+                }}
+            })}
 
             // Current question (shown above its streaming answer).
             {move || (!asked.get().is_empty())

@@ -198,6 +198,24 @@ async def answer_real(req):
             "it):\n" + safe + "\n\n" + settings.prompts.qa
         )
 
+    # Citation-check mode: reuse the whole embed+retrieve pipeline, but the
+    # `question` is a CLAIM and the answer LLM judges SUPPORT instead of
+    # answering. Swap the qa prompt for a verdict prompt (retrieval still runs
+    # on the clean claim). Uses only {question}/{context}/{example_citation};
+    # PaperQA passes extra format kwargs, which str.format() harmlessly ignores.
+    if req.get("cmd") == "check":
+        settings.prompts.qa = (
+            "You are fact-checking a claim against the provided source excerpts.\n\n"
+            "Claim: {question}\n\n"
+            "Context (excerpts from the source papers):\n{context}\n\n"
+            "Using ONLY the context, judge whether the sources support the claim. "
+            "Begin your answer with a verdict on its own line — exactly one of: "
+            "SUPPORTED, PARTIALLY SUPPORTED, NOT SUPPORTED, or INSUFFICIENT EVIDENCE. "
+            "Then justify it in 1-3 sentences, quoting the key evidence and citing "
+            "the source with a citation key like {example_citation}. If the context "
+            "does not address the claim, answer INSUFFICIENT EVIDENCE."
+        )
+
     # Where does the vector index live?
     #  - Qdrant Cloud (if configured): a SHARED index, scoped per Zotero
     #    collection + embedding model. Papers embedded by anyone in the org are
@@ -318,7 +336,8 @@ async def answer_real(req):
         send({"id": qid, "type": "done"})
         return
 
-    send({"id": qid, "type": "status", "text": "Thinking…"})
+    send({"id": qid, "type": "status",
+          "text": "Checking…" if req.get("cmd") == "check" else "Thinking…"})
     session = await _aquery_with_retry(docs, question, settings)
 
     text = (session.answer or "").strip()
@@ -389,7 +408,7 @@ def main():
             send({"id": None, "type": "error", "message": "Malformed request."})
             continue
         try:
-            if req.get("cmd") in ("ask", "index"):
+            if req.get("cmd") in ("ask", "index", "check"):
                 asyncio.run(answer_real(req))
             else:
                 send({"id": req.get("id"), "type": "error",
