@@ -598,41 +598,61 @@ fn App() -> impl IntoView {
         });
     };
 
-    // Build a clean markdown note from the current answer/verdict + cited
-    // evidence and copy it to the clipboard. (Zotero's local API is read-only,
-    // so paste it into a Zotero note — or Obsidian, or your draft.)
+    // Copy the WHOLE conversation (every round) + cited evidence as one clean
+    // markdown note. (Zotero's local API is read-only, so paste it into a Zotero
+    // note — or Obsidian, or your draft.)
     let copy_note = move || {
-        let (q, a) = (asked.get_untracked(), answer.get_untracked());
-        if a.trim().is_empty() {
+        let cur = answer.get_untracked();
+        let past = history.get_untracked();
+        if cur.trim().is_empty() && past.is_empty() {
             return;
         }
-        let mut s = if mode.get_untracked() == "check" {
-            format!("## Claim check\n\n**Claim:** {q}\n\n{a}\n")
-        } else {
-            format!("## {q}\n\n{a}\n")
-        };
-        let r = refs.get_untracked();
-        if !r.is_empty() {
-            s.push_str("\n### Sources\n");
-            for it in &r {
-                s.push_str(&format!("- {}\n", it.citation));
-                for p in &it.passages {
-                    let snip = p.snippet.trim();
-                    if !snip.is_empty() {
-                        let pg = if p.page.trim().is_empty() {
-                            String::new()
-                        } else {
-                            format!(" (p.{})", p.page.trim())
-                        };
-                        s.push_str(&format!("  > {snip}{pg}\n"));
+        // Format one round (question + answer + its sources with evidence).
+        fn fmt_turn(q: &str, a: &str, refs: &[RefItem]) -> String {
+            let mut s = format!("## {}\n\n{}\n", q.trim(), a.trim());
+            if !refs.is_empty() {
+                s.push_str("\n### Sources\n");
+                for it in refs {
+                    s.push_str(&format!("- {}\n", it.citation));
+                    for p in &it.passages {
+                        let snip = p.snippet.trim();
+                        if !snip.is_empty() {
+                            let pg = if p.page.trim().is_empty() {
+                                String::new()
+                            } else {
+                                format!(" (p.{})", p.page.trim())
+                            };
+                            s.push_str(&format!("  > {snip}{pg}\n"));
+                        }
                     }
                 }
             }
+            s
         }
-        s.push_str("\n_via PaperDock_\n");
+        let mut out = String::new();
+        for t in &past {
+            out.push_str(&fmt_turn(&t.question, &t.answer, &t.refs));
+            out.push_str("\n---\n\n");
+        }
+        if !cur.trim().is_empty() {
+            out.push_str(&fmt_turn(
+                &asked.get_untracked(),
+                &cur,
+                &refs.get_untracked(),
+            ));
+        }
+        out.push_str("\n_via PaperDock_\n");
+        let multi = !past.is_empty();
         spawn_local(async move {
-            let _ = invoke("copy_text", args(serde_json::json!({ "text": s }))).await;
-            toast.set("Copied as a note — paste into Zotero, Obsidian, or your draft.".to_string());
+            let _ = invoke("copy_text", args(serde_json::json!({ "text": out }))).await;
+            toast.set(
+                if multi {
+                    "Copied the whole conversation as a note — paste into Zotero, Obsidian, or your draft."
+                } else {
+                    "Copied as a note — paste into Zotero, Obsidian, or your draft."
+                }
+                .to_string(),
+            );
         });
     };
 
