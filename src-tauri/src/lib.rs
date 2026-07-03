@@ -666,7 +666,7 @@ fn get_config(state: State<'_, AppState>) -> UiConfig {
 
 /// URL of the feedback collector (a Cloudflare Worker on *.workers.dev).
 /// Empty = telemetry disabled at build time; feedback POSTs are skipped.
-const FEEDBACK_URL: &str = "";
+const FEEDBACK_URL: &str = "https://paperdock-feedback.chesterfield199512.workers.dev";
 
 /// Record a 👍/👎 on the last answer. Persists the user's consent + field, and
 /// (only with consent + a configured collector) POSTs a minimal, content-free
