@@ -108,6 +108,14 @@ struct Passage {
     snippet: String,
 }
 
+#[derive(Clone, Deserialize)]
+struct DraftItem {
+    claim: String,
+    verdict: String,
+    #[serde(default)]
+    detail: String,
+}
+
 /// One completed Q&A in the conversation thread.
 #[derive(Clone)]
 struct Turn {
@@ -125,6 +133,8 @@ struct AnswerEvent {
     text: Option<String>,
     #[serde(default)]
     items: Option<Vec<RefItem>>,
+    #[serde(default)]
+    claims: Option<Vec<DraftItem>>,
     #[serde(default)]
     message: Option<String>,
 }
@@ -162,6 +172,10 @@ fn App() -> impl IntoView {
     let ref_input = RwSignal::new(String::new());
     let ref_result = RwSignal::new(Option::<RefMatchWire>::None);
     let verifying = RwSignal::new(false);
+    // Draft batch citation-check.
+    let draft_input = RwSignal::new(String::new());
+    let draft_items = RwSignal::new(Vec::<DraftItem>::new());
+    let draft_running = RwSignal::new(false);
     // Conversation thread: `asked` is the current in-progress question; `history`
     // holds completed turns above it.
     let asked = RwSignal::new(String::new());
@@ -220,12 +234,19 @@ fn App() -> impl IntoView {
                         notice.set(t);
                     }
                 }
+                "draft" => {
+                    if let Some(items) = e.claims {
+                        draft_items.set(items);
+                    }
+                }
                 "done" => {
                     streaming.set(false);
+                    draft_running.set(false);
                     status.set("Indexed ✓".to_string());
                 }
                 "error" => {
                     streaming.set(false);
+                    draft_running.set(false);
                     let msg = e.message.unwrap_or_else(|| "Something went wrong.".into());
                     status.set(msg);
                 }
@@ -615,6 +636,34 @@ fn App() -> impl IntoView {
         });
     };
 
+    let submit_draft = move || {
+        let d = draft_input.get();
+        let id = selected.get();
+        if d.trim().is_empty() || id.is_empty() || draft_running.get() {
+            return;
+        }
+        let (library, key) = id.split_once("::").unwrap_or(("users/0", id.as_str()));
+        let (library, key) = (library.to_string(), key.to_string());
+        draft_items.set(Vec::new());
+        draft_running.set(true);
+        status.set("Indexing…".to_string());
+        spawn_local(async move {
+            let res = invoke(
+                "check_draft",
+                args(serde_json::json!({
+                    "library": library, "collectionKey": key, "draft": d,
+                })),
+            )
+            .await;
+            if let Err(e) = res {
+                draft_running.set(false);
+                let msg = serde_wasm_bindgen::from_value::<String>(e)
+                    .unwrap_or_else(|_| "Could not start the draft check.".into());
+                status.set(msg);
+            }
+        });
+    };
+
     let save_settings = move || {
         let (m, e, b, k) = (
             model_input.get(),
@@ -875,6 +924,10 @@ fn App() -> impl IntoView {
                     on:click=move |_| mode.set("verify".into())
                     title="Paste a reference; check it's a real paper (CrossRef)"
                 >"Verify reference"</button>
+                <button class="mode" class:on=move || mode.get() == "draft"
+                    on:click=move |_| mode.set("draft".into())
+                    title="Paste a draft; batch-check its claims against these papers"
+                >"Check draft"</button>
             </div>
 
             {move || (mode.get() == "check").then(|| view! {
@@ -889,8 +942,8 @@ fn App() -> impl IntoView {
                 </select>
             })}
 
-            // Ask / Check input (hidden in Verify mode).
-            {move || (mode.get() != "verify").then(|| view! {
+            // Ask / Check input (Verify and Draft have their own inputs).
+            {move || (mode.get() == "ask" || mode.get() == "check").then(|| view! {
                 <div class="askrow">
                     <input class="ask" type="text"
                         placeholder=move || if mode.get() == "check" {
@@ -952,6 +1005,69 @@ fn App() -> impl IntoView {
                     } else {
                         view! { <span></span> }.into_any()
                     }
+                }}
+            })}
+
+            // Check-draft: textarea + batch results.
+            {move || (mode.get() == "draft").then(|| view! {
+                <div class="draftbox">
+                    <textarea class="draft-input"
+                        placeholder="Paste a draft or paragraph — PaperDock extracts its claims and checks each against these papers…"
+                        prop:value=move || draft_input.get()
+                        prop:disabled=move || draft_running.get()
+                        on:input=move |ev| draft_input.set(event_target_value(&ev))></textarea>
+                    <button class="draft-go" prop:disabled=move || draft_running.get()
+                        on:click=move |_| submit_draft()>
+                        {move || if draft_running.get() { "Checking…".to_string() } else { "Check draft".to_string() }}
+                    </button>
+                </div>
+                {move || {
+                    let items = draft_items.get();
+                    if items.is_empty() {
+                        return ().into_any();
+                    }
+                    let count = |v: &str| items.iter().filter(|i| i.verdict == v).count();
+                    let (sup, par, no, ins) = (
+                        count("SUPPORTED"), count("PARTIALLY SUPPORTED"),
+                        count("NOT SUPPORTED"), count("INSUFFICIENT EVIDENCE"),
+                    );
+                    let total = items.len().max(1);
+                    let w = |n: usize| format!("width:{}%", n * 100 / total);
+                    view! {
+                        <div class="draft-summary">
+                            <div class="bar">
+                                <span class="seg ok" style=w(sup)></span>
+                                <span class="seg par" style=w(par)></span>
+                                <span class="seg no" style=w(no)></span>
+                                <span class="seg ins" style=w(ins)></span>
+                            </div>
+                            <div class="legend">
+                                <span class="ok">{format!("{sup} supported")}</span>
+                                <span class="par">{format!("{par} partial")}</span>
+                                <span class="no">{format!("{no} unsupported")}</span>
+                                <span class="ins">{format!("{ins} insufficient")}</span>
+                            </div>
+                        </div>
+                        <div class="draft-list">
+                            {items.into_iter().map(|it| {
+                                let cls = match it.verdict.as_str() {
+                                    "SUPPORTED" => "dv ok",
+                                    "PARTIALLY SUPPORTED" => "dv par",
+                                    "NOT SUPPORTED" => "dv no",
+                                    _ => "dv ins",
+                                };
+                                view! {
+                                    <div class="draft-item">
+                                        <span class=cls>{it.verdict}</span>
+                                        <div class="di-body">
+                                            <div class="di-claim">{it.claim}</div>
+                                            <div class="di-detail">{it.detail}</div>
+                                        </div>
+                                    </div>
+                                }
+                            }).collect::<Vec<_>>()}
+                        </div>
+                    }.into_any()
                 }}
             })}
 

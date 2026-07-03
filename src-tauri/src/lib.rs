@@ -83,6 +83,19 @@ async fn check(
     spawn_worker(app, state, "check", library, collection_key, claim, String::new(), sk).await
 }
 
+/// Draft batch citation-check: extract claims from a pasted draft and judge each
+/// against the collection. Results arrive as a `draft` answer event.
+#[tauri::command]
+async fn check_draft(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    library: String,
+    collection_key: String,
+    draft: String,
+) -> Result<(), String> {
+    spawn_worker(app, state, "check_draft", library, collection_key, draft, String::new(), None).await
+}
+
 /// One checkable paper (has a PDF) in a collection — for the citation-check
 /// source picker.
 #[derive(serde::Serialize)]
@@ -693,6 +706,7 @@ pub fn run() {
             list_collections,
             ask,
             check,
+            check_draft,
             list_collection_papers,
             verify_reference,
             copy_text,

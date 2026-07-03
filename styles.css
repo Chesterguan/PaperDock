@@ -741,3 +741,40 @@ input.ask:disabled {
   transition: color var(--t), border-color var(--t), background var(--t);
 }
 .copy-note:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }
+
+/* ---- check-draft (batch) ---- */
+.draftbox { display: flex; flex-direction: column; gap: 10px; }
+.draft-input {
+  width: 100%; min-height: 120px; resize: vertical;
+  padding: 12px 14px; font-family: var(--sans); font-size: 13.5px; line-height: 1.6;
+  color: var(--text); background: var(--bg-raised);
+  border: 1px solid var(--border); border-radius: 8px;
+}
+.draft-input:focus { outline: none; border-color: var(--accent); }
+.draft-go {
+  align-self: flex-start; font-family: var(--sans); font-size: 13px; font-weight: 500;
+  color: var(--bg); background: var(--accent); border: none; border-radius: 8px;
+  padding: 9px 20px; cursor: pointer; transition: opacity var(--t);
+}
+.draft-go:hover { opacity: .88; } .draft-go:disabled { opacity: .5; cursor: default; }
+
+.draft-summary { margin: 18px 0 6px; }
+.bar { display: flex; height: 8px; border-radius: 4px; overflow: hidden; background: var(--border); }
+.seg { display: block; height: 100%; }
+.seg.ok { background: var(--accent); }
+.seg.par { background: #d8b07a; }
+.seg.no { background: #d98b7a; }
+.seg.ins { background: var(--text-faint); }
+.legend { margin-top: 8px; display: flex; flex-wrap: wrap; gap: 14px; font-family: var(--mono); font-size: 11px; }
+.legend .ok { color: var(--accent); } .legend .par { color: #d8b07a; }
+.legend .no { color: #d98b7a; } .legend .ins { color: var(--text-faint); }
+
+.draft-list { margin-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.draft-item { display: flex; gap: 12px; padding: 12px; background: var(--bg-raised); border: 1px solid var(--border); border-radius: 8px; }
+.dv { flex: 0 0 auto; align-self: flex-start; font-family: var(--mono); font-size: 10px; padding: 3px 8px; border-radius: 5px; white-space: nowrap; }
+.dv.ok { color: var(--accent); background: var(--accent-dim); }
+.dv.par { color: #d8b07a; background: rgba(216,176,122,.12); }
+.dv.no { color: #d98b7a; background: rgba(217,139,122,.12); }
+.dv.ins { color: var(--text-faint); background: rgba(97,102,108,.12); }
+.di-claim { font-size: 13.5px; color: var(--text); line-height: 1.5; }
+.di-detail { margin-top: 5px; font-size: 12px; color: var(--text-dim); line-height: 1.5; }

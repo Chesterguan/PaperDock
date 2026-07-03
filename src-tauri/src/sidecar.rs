@@ -16,8 +16,17 @@ pub enum AnswerEvent {
     References { items: Vec<RefItem> },
     /// A non-fatal heads-up (e.g. some papers had no PDF and were skipped).
     Notice { message: String },
+    /// Draft batch citation-check: per-claim verdicts.
+    Draft { claims: Vec<DraftItem> },
     Done,
     Error { message: String },
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct DraftItem {
+    pub claim: String,
+    pub verdict: String,
+    pub detail: String,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -482,6 +491,34 @@ fn parse_event(raw: &str) -> Option<AnswerEvent> {
                 })
                 .unwrap_or_default();
             Some(AnswerEvent::References { items })
+        }
+        "draft" => {
+            let items = v
+                .get("items")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .map(|it| DraftItem {
+                            claim: it
+                                .get("claim")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            verdict: it
+                                .get("verdict")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            detail: it
+                                .get("detail")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(AnswerEvent::Draft { claims: items })
         }
         "done" => Some(AnswerEvent::Done),
         "error" => Some(AnswerEvent::Error {
