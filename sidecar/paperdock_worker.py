@@ -358,7 +358,7 @@ async def answer_real(req):
     if req.get("cmd") == "check_draft":
         import re as _re
         import litellm
-        draft = question[:8000]
+        draft = question[:20000]
         send({"id": qid, "type": "status", "text": "Extracting claims…"})
         ex_prompt = (
             "Extract up to 8 checkable factual claims from the text below. "

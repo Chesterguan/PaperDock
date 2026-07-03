@@ -664,6 +664,19 @@ fn App() -> impl IntoView {
         });
     };
 
+    // Upload a draft file (.txt/.md/.tex/.pdf) → its text fills the draft box.
+    let pick_draft = move || {
+        spawn_local(async move {
+            if let Ok(v) = invoke("pick_draft_file", args(serde_json::json!({}))).await {
+                if let Ok(text) = serde_wasm_bindgen::from_value::<String>(v) {
+                    if !text.trim().is_empty() {
+                        draft_input.set(text);
+                    }
+                }
+            }
+        });
+    };
+
     let save_settings = move || {
         let (m, e, b, k) = (
             model_input.get(),
@@ -1011,8 +1024,11 @@ fn App() -> impl IntoView {
             // Check-draft: textarea + batch results.
             {move || (mode.get() == "draft").then(|| view! {
                 <div class="draftbox">
+                    <button class="draft-upload" title="Upload a .txt / .md / .tex / .pdf draft"
+                        prop:disabled=move || draft_running.get()
+                        on:click=move |_| pick_draft()>"📎 Upload a draft file"</button>
                     <textarea class="draft-input"
-                        placeholder="Paste a draft or paragraph — PaperDock extracts its claims and checks each against these papers…"
+                        placeholder="…or paste a draft / paragraph — PaperDock extracts its claims and checks each against these papers."
                         prop:value=move || draft_input.get()
                         prop:disabled=move || draft_running.get()
                         on:input=move |ev| draft_input.set(event_target_value(&ev))></textarea>

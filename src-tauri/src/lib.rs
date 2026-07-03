@@ -96,6 +96,44 @@ async fn check_draft(
     spawn_worker(app, state, "check_draft", library, collection_key, draft, String::new(), None).await
 }
 
+/// Pick a draft file (.txt/.md/.tex/.pdf) and return its text — for Check draft.
+#[tauri::command]
+async fn pick_draft_file(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let file = app
+        .dialog()
+        .file()
+        .add_filter("Draft", &["txt", "md", "markdown", "tex", "pdf"])
+        .blocking_pick_file();
+    let Some(file) = file else { return Ok(String::new()) };
+    let path = file
+        .into_path()
+        .map_err(|_| "Could not resolve the file path.".to_string())?;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if ext == "pdf" {
+        let py = sidecar::interpreter(&app, &state.worker_path);
+        let out = std::process::Command::new(py)
+            .arg("-c")
+            .arg("import sys,pypdf;r=pypdf.PdfReader(sys.argv[1]);print('\\n'.join((p.extract_text() or '') for p in r.pages))")
+            .arg(&path)
+            .output()
+            .map_err(|_| "Could not read the PDF.".to_string())?;
+        if !out.status.success() {
+            return Err("Could not extract text from that PDF.".to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        std::fs::read_to_string(&path).map_err(|_| "Could not read the file.".to_string())
+    }
+}
+
 /// One checkable paper (has a PDF) in a collection — for the citation-check
 /// source picker.
 #[derive(serde::Serialize)]
@@ -707,6 +745,7 @@ pub fn run() {
             ask,
             check,
             check_draft,
+            pick_draft_file,
             list_collection_papers,
             verify_reference,
             copy_text,

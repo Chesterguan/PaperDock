@@ -230,6 +230,12 @@ fn python_for_worker(app: &tauri::AppHandle, worker_path: &str) -> String {
     resolve_python(app, worker_path).unwrap_or_else(|| "python3".to_string())
 }
 
+/// The provisioned Python interpreter (for one-off tasks like PDF text
+/// extraction). Same resolution as the worker uses.
+pub fn interpreter(app: &tauri::AppHandle, worker_path: &str) -> String {
+    python_for_worker(app, worker_path)
+}
+
 // ---- First-run Python environment provisioning -------------------------
 //
 // A packaged .app ships only the worker + a `uv` binary + a pinned
