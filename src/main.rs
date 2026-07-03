@@ -238,6 +238,7 @@ fn App() -> impl IntoView {
     let export_key = RwSignal::new(true);    // "Include LLM key" checkbox
     let toast = RwSignal::new(String::new()); // transient confirmation
     let saved_link = RwSignal::new(String::new()); // zotero:// link of the last saved note
+    let save_msg = RwSignal::new(String::new()); // inline Save-to-Zotero result (under the button)
 
     // ---- single "answer" event listener, wired once at startup ----------
     {
@@ -579,6 +580,8 @@ fn App() -> impl IntoView {
         notice.set(String::new());
         fb_rated.set(false);
         fb_ask.set(false);
+        save_msg.set(String::new());
+        saved_link.set(String::new());
         streaming.set(true);
         status.set("Indexing…".to_string());
         let checking = mode.get_untracked() == "check";
@@ -677,10 +680,11 @@ fn App() -> impl IntoView {
             .to_locale_string("en-US", &JsValue::UNDEFINED)
             .as_string()
             .unwrap_or_default();
-        let mut html = String::from(
-            "<p><b>📄 PaperDock</b> — research notes</p><hr>",
-        );
-        let mut plain = String::from("# PaperDock — research notes\n\n");
+        // Start with the first question so Zotero titles the note with it (its
+        // title is the note's first line) — distinct per note. PaperDock's mark
+        // lives in the footer.
+        let mut html = String::new();
+        let mut plain = String::new();
         for t in &past {
             html.push_str(&round_html(&t.question, &t.answer, &t.refs));
             plain.push_str(&round_plain(&t.question, &t.answer, &t.refs));
@@ -697,28 +701,25 @@ fn App() -> impl IntoView {
         ));
         let _ = &plain; // (kept for a possible clipboard fallback; unused now)
         saved_link.set(String::new());
-        toast.set("Saving to Zotero…".to_string());
+        save_msg.set("Saving to Zotero…".to_string());
         spawn_local(async move {
             match invoke("save_to_zotero", args(serde_json::json!({ "html": html }))).await {
                 Ok(v) => {
                     if let Ok(n) = serde_wasm_bindgen::from_value::<SavedNote>(v) {
                         saved_link.set(n.link);
-                        toast.set(if n.is_group {
-                            format!(
-                                "Saved to Zotero → {} · a shared group; move it if you want it private.",
-                                n.location
-                            )
+                        save_msg.set(if n.is_group {
+                            format!("Saved to {} — a shared group; move it if you want it private.", n.location)
                         } else {
-                            format!("Saved to Zotero → {} ✓", n.location)
+                            format!("Saved to {} ✓", n.location)
                         });
                     } else {
-                        toast.set("Saved to Zotero.".to_string());
+                        save_msg.set("Saved to Zotero.".to_string());
                     }
                 }
                 Err(e) => {
                     let msg = serde_wasm_bindgen::from_value::<String>(e)
                         .unwrap_or_else(|_| "Could not save to Zotero — is it open?".into());
-                    toast.set(msg);
+                    save_msg.set(msg);
                 }
             }
         });
@@ -735,6 +736,7 @@ fn App() -> impl IntoView {
         status.set(String::new());
         active_source.set(0);
         saved_link.set(String::new());
+        save_msg.set(String::new());
         toast.set(String::new());
         fb_rated.set(false);
         fb_ask.set(false);
@@ -876,18 +878,7 @@ fn App() -> impl IntoView {
             </header>
 
             {move || (!toast.get().is_empty()).then(|| view! {
-                <div class="toast">
-                    {move || toast.get()}
-                    {move || (!saved_link.get().is_empty()).then(|| view! {
-                        <a class="toast-link" href="#" on:click=move |ev: web_sys::MouseEvent| {
-                            ev.prevent_default();
-                            let l = saved_link.get();
-                            spawn_local(async move {
-                                let _ = invoke("open_zotero_uri", args(serde_json::json!({ "uri": l }))).await;
-                            });
-                        }>"Open in Zotero →"</a>
-                    })}
-                </div>
+                <div class="toast">{move || toast.get()}</div>
             })}
 
             {move || (!env_ready.get()).then(|| view! {
@@ -1091,8 +1082,8 @@ fn App() -> impl IntoView {
                 >"Check draft"</button>
                 {move || (!answer.get().is_empty() || !history.get().is_empty()).then(|| view! {
                     <button class="newchat"
-                        title="Start a fresh conversation — do this when you switch to a new topic, so a saved note stays one coherent thread."
-                        on:click=move |_| new_chat()>"＋ New"</button>
+                        title="Start a fresh conversation — clears the current thread. Do this when you switch to a new topic, so a saved note stays one coherent conversation."
+                        on:click=move |_| new_chat()>"＋ New chat"</button>
                 })}
             </div>
 
@@ -1282,6 +1273,20 @@ fn App() -> impl IntoView {
             {move || (!answer.get().is_empty() && !streaming.get()).then(|| view! {
                 <button class="copy-note" title="Save the whole conversation as a note directly into Zotero (goes to the collection you have open in Zotero)"
                     on:click=move |_| save_note()>"⌘ Save to Zotero note"</button>
+            })}
+            {move || (!save_msg.get().is_empty()).then(|| view! {
+                <div class="save-msg">
+                    <span>{move || save_msg.get()}</span>
+                    {move || (!saved_link.get().is_empty()).then(|| view! {
+                        <a class="save-open" href="#" on:click=move |ev: web_sys::MouseEvent| {
+                            ev.prevent_default();
+                            let l = saved_link.get();
+                            spawn_local(async move {
+                                let _ = invoke("open_zotero_uri", args(serde_json::json!({ "uri": l }))).await;
+                            });
+                        }>"Open in Zotero →"</a>
+                    })}
+                </div>
             })}
 
             {move || (!answer.get().is_empty() && !streaming.get()).then(|| {
