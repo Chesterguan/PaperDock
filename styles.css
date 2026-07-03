@@ -726,3 +726,18 @@ input.ask:disabled {
 .ref-result.ok { color: var(--accent); background: var(--accent-dim); }
 .ref-result.warn { color: #d8b07a; background: rgba(200, 160, 90, 0.10); }
 .ref-meta { margin-top: 4px; color: var(--text-dim); font-family: var(--mono); font-size: 11.5px; }
+
+/* copy-as-note */
+.copy-note {
+  margin: 6px 0 2px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 12px;
+  cursor: pointer;
+  transition: color var(--t), border-color var(--t), background var(--t);
+}
+.copy-note:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-dim); }

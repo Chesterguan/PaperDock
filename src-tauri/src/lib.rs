@@ -455,6 +455,27 @@ fn open_url(url: String) -> Result<(), String> {
         .map_err(|_| "Could not open the link.".to_string())
 }
 
+/// Copy text to the macOS clipboard (for "copy as note").
+#[tauri::command]
+fn copy_text(text: String) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|_| "Could not access the clipboard.".to_string())?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "Could not access the clipboard.".to_string())?
+        .write_all(text.as_bytes())
+        .map_err(|_| "Could not write to the clipboard.".to_string())?;
+    child
+        .wait()
+        .map_err(|_| "Clipboard copy failed.".to_string())?;
+    Ok(())
+}
+
 /// Return the frontend-safe config (no secrets).
 #[tauri::command]
 fn get_config(state: State<'_, AppState>) -> UiConfig {
@@ -674,6 +695,7 @@ pub fn run() {
             check,
             list_collection_papers,
             verify_reference,
+            copy_text,
             index_collection,
             cancel,
             env_status,

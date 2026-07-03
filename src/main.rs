@@ -577,6 +577,44 @@ fn App() -> impl IntoView {
         });
     };
 
+    // Build a clean markdown note from the current answer/verdict + cited
+    // evidence and copy it to the clipboard. (Zotero's local API is read-only,
+    // so paste it into a Zotero note — or Obsidian, or your draft.)
+    let copy_note = move || {
+        let (q, a) = (asked.get_untracked(), answer.get_untracked());
+        if a.trim().is_empty() {
+            return;
+        }
+        let mut s = if mode.get_untracked() == "check" {
+            format!("## Claim check\n\n**Claim:** {q}\n\n{a}\n")
+        } else {
+            format!("## {q}\n\n{a}\n")
+        };
+        let r = refs.get_untracked();
+        if !r.is_empty() {
+            s.push_str("\n### Sources\n");
+            for it in &r {
+                s.push_str(&format!("- {}\n", it.citation));
+                for p in &it.passages {
+                    let snip = p.snippet.trim();
+                    if !snip.is_empty() {
+                        let pg = if p.page.trim().is_empty() {
+                            String::new()
+                        } else {
+                            format!(" (p.{})", p.page.trim())
+                        };
+                        s.push_str(&format!("  > {snip}{pg}\n"));
+                    }
+                }
+            }
+        }
+        s.push_str("\n_via PaperDock_\n");
+        spawn_local(async move {
+            let _ = invoke("copy_text", args(serde_json::json!({ "text": s }))).await;
+            toast.set("Copied as a note — paste into Zotero, Obsidian, or your draft.".to_string());
+        });
+    };
+
     let save_settings = move || {
         let (m, e, b, k) = (
             model_input.get(),
@@ -955,6 +993,11 @@ fn App() -> impl IntoView {
                 }}
                 {move || streaming.get().then(|| view! { <span class="cursor"></span> })}
             </div>
+
+            {move || (!answer.get().is_empty() && !streaming.get()).then(|| view! {
+                <button class="copy-note" title="Copy this answer + evidence as a note"
+                    on:click=move |_| copy_note()>"⧉ Copy as note"</button>
+            })}
 
             <div class="refs">
                 // One tab per cited paper; the panel shows the active paper's
