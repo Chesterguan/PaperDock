@@ -14,9 +14,9 @@
     "windows": [
       {
         "title": "PaperDock",
-        "width": 760,
-        "height": 640,
-        "minWidth": 480,
+        "width": 680,
+        "height": 740,
+        "minWidth": 460,
         "minHeight": 480
       }
     ],
