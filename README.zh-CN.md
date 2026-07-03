@@ -148,7 +148,7 @@ npx @tauri-apps/cli dev      # 运行;打包用 `build`
 
 **Ziyuan (Chester) Guan** 的个人项目,得到
 **[UF IC3 Center](https://ic3.center.ufl.edu/)**(Intelligent Clinical Care Center)
-与 **[PRISMAP Lab](https://github.com/Prisma-pResearch)** 相关人员的支持。检索与回答由
+与 **[PRISMAP Lab](https://prismap.medicine.ufl.edu/)** 相关人员的支持。检索与回答由
 [PaperQA](https://github.com/Future-House/paper-qa) 驱动。
 
 ## 许可证

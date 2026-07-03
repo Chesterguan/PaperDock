@@ -178,7 +178,7 @@ retrieval + answering, so most changes touch the Rust/Leptos app (`src/`,
 
 A personal project by **Ziyuan (Chester) Guan**, built with the support of the
 **[UF IC3 Center](https://ic3.center.ufl.edu/)** (Intelligent Clinical Care Center)
-and the **[PRISMAP Lab](https://github.com/Prisma-pResearch)**. Grounded by
+and the **[PRISMAP Lab](https://prismap.medicine.ufl.edu/)**. Grounded by
 [PaperQA](https://github.com/Future-House/paper-qa).
 
 ## License
