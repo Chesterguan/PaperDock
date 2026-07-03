@@ -115,6 +115,23 @@ struct SavedNote {
     link: String,
 }
 
+/// Pull the fraction from a "…paper 3/12…" progress status, if present.
+fn parse_frac(s: &str) -> Option<f64> {
+    let slash = s.find('/')?;
+    let before: String = s[..slash]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let after: String = s[slash + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    let a: f64 = before.parse().ok()?;
+    let b: f64 = after.parse().ok()?;
+    (b > 0.0).then(|| (a / b).clamp(0.0, 1.0))
+}
+
 #[derive(Clone, Deserialize)]
 struct DraftItem {
     claim: String,
@@ -1005,6 +1022,11 @@ fn App() -> impl IntoView {
                         status.get()
                     }
                 }}
+                {move || parse_frac(&status.get()).map(|f| view! {
+                    <div class="progress">
+                        <div class="progress-fill" style=format!("width:{:.0}%", f * 100.0)></div>
+                    </div>
+                })}
             </div>
 
             <div class="modes">
