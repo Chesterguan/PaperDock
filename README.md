@@ -12,6 +12,8 @@ apps. It works *around your own knowledge base* to make research faster: ask,
 fact-check claims, and vet citations against the papers you already keep in Zotero.
 (Longer term it may become a Zotero plugin — undecided. See the [roadmap](ROADMAP.md).)
 
+<p align="center"><img src="docs/demo.gif" alt="PaperDock — ask your Zotero library and check a draft" width="380"></p>
+
 ---
 
 ## 1. Install
