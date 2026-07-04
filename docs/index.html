@@ -234,6 +234,34 @@
     </div>
   </section>
 
+  <section id="feedback">
+    <div class="sec-label">What researchers say</div>
+    <p style="color:var(--dim);max-width:60ch;margin:0 0 26px;line-height:1.6">
+      PaperDock can send an anonymous 👍/👎 after each answer — just a rating and
+      your research field, never your papers or questions. Here's the live tally.
+    </p>
+    <div id="fb-stats" style="color:var(--dim)">Loading…</div>
+  </section>
+  <script>
+    (async () => {
+      const el = document.getElementById('fb-stats');
+      try {
+        const r = await fetch('https://paperdock-feedback.chesterfield199512.workers.dev/stats');
+        const d = await r.json();
+        if (!d || !d.total) { el.textContent = 'No feedback yet — be the first.'; return; }
+        const pct = Math.round((d.up / d.total) * 100);
+        const rows = Object.entries(d.byField)
+          .sort((a, b) => (b[1].up + b[1].down) - (a[1].up + a[1].down))
+          .map(([f, v]) => `<li style="display:flex;justify-content:space-between;border-bottom:1px solid var(--line);padding:7px 0"><span style="color:var(--text)">${f.replace(/[<>&]/g,'')}</span><span>${v.up} 👍 · ${v.down} 👎</span></li>`)
+          .join('');
+        el.innerHTML =
+          `<div style="font-family:var(--serif);font-size:2.6rem;color:var(--accent);line-height:1">${pct}% helpful</div>` +
+          `<div style="margin:8px 0 22px">${d.up} 👍 · ${d.down} 👎 · ${d.total} ratings</div>` +
+          `<ul style="list-style:none;padding:0;margin:0;max-width:44ch;font-family:var(--mono);font-size:13px">${rows}</ul>`;
+      } catch (e) { el.parentElement.style.display = 'none'; } // hide the section if unreachable
+    })();
+  </script>
+
   <footer>
     <div class="foot-grid">
       <p class="credit">

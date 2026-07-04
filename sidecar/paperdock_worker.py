@@ -105,6 +105,33 @@ async def _aquery_with_retry(docs, question, settings):
             raise
 
 
+# Verdict prompt shared by Check-citation and Check-draft. Uses only
+# {question}/{context}/{example_citation}; PaperQA passes extra format kwargs
+# which str.format() harmlessly ignores.
+CHECK_QA = (
+    "You are fact-checking a claim against the provided source excerpts.\n\n"
+    "Claim: {question}\n\n"
+    "Context (excerpts from the source papers):\n{context}\n\n"
+    "Using ONLY the context, judge whether the sources support the claim. "
+    "Begin your answer with a verdict on its own line — exactly one of: "
+    "SUPPORTED, PARTIALLY SUPPORTED, NOT SUPPORTED, or INSUFFICIENT EVIDENCE. "
+    "Then justify it in 1-3 sentences, quoting the key evidence and citing "
+    "the source with a citation key like {example_citation}. If the context "
+    "does not address the claim, answer INSUFFICIENT EVIDENCE."
+)
+
+
+def verdict_of(text):
+    """Extract the verdict label from a check answer (first line / start)."""
+    t = (text or "").strip().upper()
+    # Longest/compound labels first so "SUPPORTED" doesn't shadow the others.
+    for v in ("PARTIALLY SUPPORTED", "NOT SUPPORTED", "INSUFFICIENT EVIDENCE",
+              "SUPPORTED"):
+        if t.startswith(v) or v in t[:70]:
+            return v
+    return "INSUFFICIENT EVIDENCE"
+
+
 async def answer_real(req):
     qid = req["id"]
     index_only = req.get("cmd") == "index"  # pre-embed into Qdrant, no LLM query
@@ -203,18 +230,8 @@ async def answer_real(req):
     # answering. Swap the qa prompt for a verdict prompt (retrieval still runs
     # on the clean claim). Uses only {question}/{context}/{example_citation};
     # PaperQA passes extra format kwargs, which str.format() harmlessly ignores.
-    if req.get("cmd") == "check":
-        settings.prompts.qa = (
-            "You are fact-checking a claim against the provided source excerpts.\n\n"
-            "Claim: {question}\n\n"
-            "Context (excerpts from the source papers):\n{context}\n\n"
-            "Using ONLY the context, judge whether the sources support the claim. "
-            "Begin your answer with a verdict on its own line — exactly one of: "
-            "SUPPORTED, PARTIALLY SUPPORTED, NOT SUPPORTED, or INSUFFICIENT EVIDENCE. "
-            "Then justify it in 1-3 sentences, quoting the key evidence and citing "
-            "the source with a citation key like {example_citation}. If the context "
-            "does not address the claim, answer INSUFFICIENT EVIDENCE."
-        )
+    if req.get("cmd") in ("check", "check_draft"):
+        settings.prompts.qa = CHECK_QA
 
     # Where does the vector index live?
     #  - Qdrant Cloud (if configured): a SHARED index, scoped per Zotero
@@ -336,6 +353,52 @@ async def answer_real(req):
         send({"id": qid, "type": "done"})
         return
 
+    # Draft batch check: pull the checkable claims out of a pasted draft, then
+    # judge each against the collection. Emits one "draft" result + counts.
+    if req.get("cmd") == "check_draft":
+        import re as _re
+        import litellm
+        draft = question[:20000]
+        send({"id": qid, "type": "status", "text": "Extracting claims…"})
+        ex_prompt = (
+            "Extract up to 8 checkable factual claims from the text below. "
+            "Return ONLY a JSON array of short standalone sentences — no prose, "
+            "no numbering.\n\nText:\n" + draft
+        )
+        claims = []
+        try:
+            r = await litellm.acompletion(
+                model=model, temperature=0.0,
+                api_base=(api_base or None),
+                messages=[{"role": "user", "content": ex_prompt}])
+            raw = r["choices"][0]["message"]["content"]
+            m = _re.search(r"\[.*\]", raw, _re.S)
+            if m:
+                claims = [str(c).strip() for c in json.loads(m.group(0))
+                          if str(c).strip()]
+        except Exception as exc:
+            sys.stderr.write("claim extract failed: %r\n" % exc)
+        claims = claims[:8]
+        if not claims:
+            send({"id": qid, "type": "error",
+                  "message": "Couldn't find checkable claims in that text."})
+            return
+        items = []
+        for i, claim in enumerate(claims, 1):
+            send({"id": qid, "type": "status",
+                  "text": "Checking claim %d/%d…" % (i, len(claims))})
+            try:
+                session = await docs.aquery(claim, settings=settings)
+                ans = (session.answer or "").strip()
+            except Exception as exc:
+                ans = "INSUFFICIENT EVIDENCE"
+                sys.stderr.write("draft claim failed: %r\n" % exc)
+            items.append({"claim": claim, "verdict": verdict_of(ans),
+                          "detail": " ".join(ans.split())[:240]})
+        send({"id": qid, "type": "draft", "items": items})
+        send({"id": qid, "type": "done"})
+        return
+
     send({"id": qid, "type": "status",
           "text": "Checking…" if req.get("cmd") == "check" else "Thinking…"})
     session = await _aquery_with_retry(docs, question, settings)
@@ -408,7 +471,7 @@ def main():
             send({"id": None, "type": "error", "message": "Malformed request."})
             continue
         try:
-            if req.get("cmd") in ("ask", "index", "check"):
+            if req.get("cmd") in ("ask", "index", "check", "check_draft"):
                 asyncio.run(answer_real(req))
             else:
                 send({"id": req.get("id"), "type": "error",

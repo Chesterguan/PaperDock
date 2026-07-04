@@ -74,6 +74,10 @@ struct Config {
     // True when a key (env or saved) exists, so the UI can hide the key prompt.
     #[serde(default)]
     has_api_key: bool,
+    #[serde(default)]
+    field: String,
+    #[serde(default)]
+    tele_consent: Option<bool>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -108,6 +112,38 @@ struct Passage {
     snippet: String,
 }
 
+#[derive(Clone, Deserialize)]
+struct SavedNote {
+    location: String,
+    is_group: bool,
+    link: String,
+}
+
+/// Pull the fraction from a "…paper 3/12…" progress status, if present.
+fn parse_frac(s: &str) -> Option<f64> {
+    let slash = s.find('/')?;
+    let before: String = s[..slash]
+        .chars()
+        .rev()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let after: String = s[slash + 1..].chars().take_while(|c| c.is_ascii_digit()).collect();
+    let a: f64 = before.parse().ok()?;
+    let b: f64 = after.parse().ok()?;
+    (b > 0.0).then(|| (a / b).clamp(0.0, 1.0))
+}
+
+#[derive(Clone, Deserialize)]
+struct DraftItem {
+    claim: String,
+    verdict: String,
+    #[serde(default)]
+    detail: String,
+}
+
 /// One completed Q&A in the conversation thread.
 #[derive(Clone)]
 struct Turn {
@@ -125,6 +161,8 @@ struct AnswerEvent {
     text: Option<String>,
     #[serde(default)]
     items: Option<Vec<RefItem>>,
+    #[serde(default)]
+    claims: Option<Vec<DraftItem>>,
     #[serde(default)]
     message: Option<String>,
 }
@@ -162,12 +200,23 @@ fn App() -> impl IntoView {
     let ref_input = RwSignal::new(String::new());
     let ref_result = RwSignal::new(Option::<RefMatchWire>::None);
     let verifying = RwSignal::new(false);
+    // Draft batch citation-check.
+    let draft_input = RwSignal::new(String::new());
+    let draft_items = RwSignal::new(Vec::<DraftItem>::new());
+    let draft_running = RwSignal::new(false);
     // Conversation thread: `asked` is the current in-progress question; `history`
     // holds completed turns above it.
     let asked = RwSignal::new(String::new());
     let history = RwSignal::new(Vec::<Turn>::new());
     let turn_id = RwSignal::new(0usize);
     let notice = RwSignal::new(String::new()); // coverage heads-up (skipped PDFs)
+
+    // Feedback (👍/👎) — opt-in, content-free.
+    let fb_consent = RwSignal::new(None::<bool>); // None = not asked yet
+    let fb_field = RwSignal::new(String::new()); // user's research field
+    let fb_rated = RwSignal::new(false); // rated the current answer?
+    let fb_ask = RwSignal::new(false); // showing the consent prompt?
+    let fb_pending = RwSignal::new(String::new()); // rating held while asking consent
     let has_key = RwSignal::new(true); // assume present until startup says otherwise
     let key_input = RwSignal::new(String::new());
     // Settings panel (model / embedding / base URL / key).
@@ -188,6 +237,8 @@ fn App() -> impl IntoView {
     let needs_config = RwSignal::new(false); // true when no key configured (fresh install)
     let export_key = RwSignal::new(true);    // "Include LLM key" checkbox
     let toast = RwSignal::new(String::new()); // transient confirmation
+    let saved_link = RwSignal::new(String::new()); // zotero:// link of the last saved note
+    let save_msg = RwSignal::new(String::new()); // inline Save-to-Zotero result (under the button)
 
     // ---- single "answer" event listener, wired once at startup ----------
     {
@@ -220,12 +271,19 @@ fn App() -> impl IntoView {
                         notice.set(t);
                     }
                 }
+                "draft" => {
+                    if let Some(items) = e.claims {
+                        draft_items.set(items);
+                    }
+                }
                 "done" => {
                     streaming.set(false);
+                    draft_running.set(false);
                     status.set("Indexed ✓".to_string());
                 }
                 "error" => {
                     streaming.set(false);
+                    draft_running.set(false);
                     let msg = e.message.unwrap_or_else(|| "Something went wrong.".into());
                     status.set(msg);
                 }
@@ -371,6 +429,8 @@ fn App() -> impl IntoView {
                 embedding_input.set(cfg.embedding);
                 apibase_input.set(cfg.api_base);
                 qdrant_url_input.set(cfg.qdrant_url);
+                fb_consent.set(cfg.tele_consent);
+                fb_field.set(cfg.field);
                 // First run with no key configured: show the "connect to your
                 // lab" gate (import a .paperdock config, or set up manually).
                 if !cfg.has_api_key {
@@ -518,6 +578,10 @@ fn App() -> impl IntoView {
         refs.set(Vec::new());
         active_source.set(0);
         notice.set(String::new());
+        fb_rated.set(false);
+        fb_ask.set(false);
+        save_msg.set(String::new());
+        saved_link.set(String::new());
         streaming.set(true);
         status.set("Indexing…".to_string());
         let checking = mode.get_untracked() == "check";
@@ -573,6 +637,174 @@ fn App() -> impl IntoView {
                 .and_then(|v| serde_wasm_bindgen::from_value::<RefMatchWire>(v).map_err(|_| JsValue::NULL))
             {
                 ref_result.set(Some(m));
+            }
+        });
+    };
+
+    // Save the WHOLE (contextual) conversation as a compact HTML note directly
+    // into Zotero. Keeps every round's question + answer (follow-ups need the
+    // context) but trims the bulky evidence to a compact source line, with a
+    // PaperDock header/footer + timestamp. Goes to Zotero's open collection.
+    let save_note = move || {
+        let cur = answer.get_untracked();
+        let past = history.get_untracked();
+        if cur.trim().is_empty() && past.is_empty() {
+            return;
+        }
+        fn esc(s: &str) -> String {
+            s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        }
+        fn round_html(q: &str, a: &str, refs: &[RefItem]) -> String {
+            let mut s = format!("<h3>{}</h3>", esc(q.trim()));
+            for para in a.trim().split("\n\n") {
+                let p = para.trim();
+                if !p.is_empty() {
+                    s.push_str(&format!("<p>{}</p>", esc(p)));
+                }
+            }
+            if !refs.is_empty() {
+                let cites: Vec<String> = refs.iter().map(|r| esc(&r.citation)).collect();
+                s.push_str(&format!("<p><b>Sources:</b> {}</p>", cites.join(" · ")));
+            }
+            s
+        }
+        fn round_plain(q: &str, a: &str, refs: &[RefItem]) -> String {
+            let mut s = format!("## {}\n\n{}\n", q.trim(), a.trim());
+            if !refs.is_empty() {
+                let cites: Vec<String> = refs.iter().map(|r| r.citation.clone()).collect();
+                s.push_str(&format!("Sources: {}\n", cites.join(" · ")));
+            }
+            s
+        }
+        let when = js_sys::Date::new_0()
+            .to_locale_string("en-US", &JsValue::UNDEFINED)
+            .as_string()
+            .unwrap_or_default();
+        // Start with the first question so Zotero titles the note with it (its
+        // title is the note's first line) — distinct per note. PaperDock's mark
+        // lives in the footer.
+        let mut html = String::new();
+        let mut plain = String::new();
+        for t in &past {
+            html.push_str(&round_html(&t.question, &t.answer, &t.refs));
+            plain.push_str(&round_plain(&t.question, &t.answer, &t.refs));
+            plain.push('\n');
+        }
+        if !cur.trim().is_empty() {
+            let (q, r) = (asked.get_untracked(), refs.get_untracked());
+            html.push_str(&round_html(&q, &cur, &r));
+            plain.push_str(&round_plain(&q, &cur, &r));
+        }
+        html.push_str(&format!(
+            "<hr><p><i>Captured with PaperDock · {}</i></p>",
+            esc(&when)
+        ));
+        let _ = &plain; // (kept for a possible clipboard fallback; unused now)
+        saved_link.set(String::new());
+        save_msg.set("Saving to Zotero…".to_string());
+        spawn_local(async move {
+            match invoke("save_to_zotero", args(serde_json::json!({ "html": html }))).await {
+                Ok(v) => {
+                    if let Ok(n) = serde_wasm_bindgen::from_value::<SavedNote>(v) {
+                        saved_link.set(n.link);
+                        save_msg.set(if n.is_group {
+                            format!("Saved to {} — a shared group; move it if you want it private.", n.location)
+                        } else {
+                            format!("Saved to {} ✓", n.location)
+                        });
+                    } else {
+                        save_msg.set("Saved to Zotero.".to_string());
+                    }
+                }
+                Err(e) => {
+                    let msg = serde_wasm_bindgen::from_value::<String>(e)
+                        .unwrap_or_else(|_| "Could not save to Zotero — is it open?".into());
+                    save_msg.set(msg);
+                }
+            }
+        });
+    };
+
+    // Start a fresh conversation (switch topics) — so a saved note is one coherent
+    // thread, not a mix of unrelated questions.
+    let new_chat = move || {
+        history.set(Vec::new());
+        answer.set(String::new());
+        asked.set(String::new());
+        refs.set(Vec::new());
+        notice.set(String::new());
+        status.set(String::new());
+        active_source.set(0);
+        saved_link.set(String::new());
+        save_msg.set(String::new());
+        toast.set(String::new());
+        fb_rated.set(false);
+        fb_ask.set(false);
+    };
+
+    // 👍/👎 on the current answer. First time asks consent + field; after that it
+    // just records (and sends only if the user opted in).
+    let send_rating = move |rating: String, consent: bool| {
+        let field = fb_field.get_untracked();
+        fb_rated.set(true);
+        spawn_local(async move {
+            let _ = invoke(
+                "submit_feedback",
+                args(serde_json::json!({ "rating": rating, "field": field, "consent": consent })),
+            )
+            .await;
+        });
+    };
+    let rate = move |r: String| match fb_consent.get_untracked() {
+        None => {
+            fb_pending.set(r);
+            fb_ask.set(true);
+        }
+        Some(consent) => send_rating(r, consent),
+    };
+    let decide_consent = move |allow: bool| {
+        fb_consent.set(Some(allow));
+        fb_ask.set(false);
+        send_rating(fb_pending.get_untracked(), allow);
+    };
+
+    let submit_draft = move || {
+        let d = draft_input.get();
+        let id = selected.get();
+        if d.trim().is_empty() || id.is_empty() || draft_running.get() {
+            return;
+        }
+        let (library, key) = id.split_once("::").unwrap_or(("users/0", id.as_str()));
+        let (library, key) = (library.to_string(), key.to_string());
+        draft_items.set(Vec::new());
+        draft_running.set(true);
+        status.set("Indexing…".to_string());
+        spawn_local(async move {
+            let res = invoke(
+                "check_draft",
+                args(serde_json::json!({
+                    "library": library, "collectionKey": key, "draft": d,
+                })),
+            )
+            .await;
+            if let Err(e) = res {
+                draft_running.set(false);
+                let msg = serde_wasm_bindgen::from_value::<String>(e)
+                    .unwrap_or_else(|_| "Could not start the draft check.".into());
+                status.set(msg);
+            }
+        });
+    };
+
+    // Upload a draft file (.txt/.md/.tex/.pdf) → its text fills the draft box.
+    let pick_draft = move || {
+        spawn_local(async move {
+            if let Ok(v) = invoke("pick_draft_file", args(serde_json::json!({}))).await {
+                if let Ok(text) = serde_wasm_bindgen::from_value::<String>(v) {
+                    if !text.trim().is_empty() {
+                        draft_input.set(text);
+                    }
+                }
             }
         });
     };
@@ -646,7 +878,7 @@ fn App() -> impl IntoView {
             </header>
 
             {move || (!toast.get().is_empty()).then(|| view! {
-                <div class="toast">{toast.get()}</div>
+                <div class="toast">{move || toast.get()}</div>
             })}
 
             {move || (!env_ready.get()).then(|| view! {
@@ -824,19 +1056,35 @@ fn App() -> impl IntoView {
                         status.get()
                     }
                 }}
+                {move || parse_frac(&status.get()).map(|f| view! {
+                    <div class="progress">
+                        <div class="progress-fill" style=format!("width:{:.0}%", f * 100.0)></div>
+                    </div>
+                })}
             </div>
 
             <div class="modes">
                 <button class="mode" class:on=move || mode.get() == "ask"
-                    on:click=move |_| mode.set("ask".into())>"Ask"</button>
+                    on:click=move |_| mode.set("ask".into())
+                    title="Ask a question — get a grounded answer with clickable citations. Follow-ups keep the context."
+                >"Ask"</button>
                 <button class="mode" class:on=move || mode.get() == "check"
                     on:click=move |_| mode.set("check".into())
-                    title="Paste a claim; check whether these papers support it"
+                    title="Paste a claim — PaperDock judges whether your papers support it (with evidence). Optionally target one paper."
                 >"Check citation"</button>
                 <button class="mode" class:on=move || mode.get() == "verify"
                     on:click=move |_| mode.set("verify".into())
-                    title="Paste a reference; check it's a real paper (CrossRef)"
+                    title="Paste a reference — check it's a real paper via CrossRef (catches fabricated citations)."
                 >"Verify reference"</button>
+                <button class="mode" class:on=move || mode.get() == "draft"
+                    on:click=move |_| mode.set("draft".into())
+                    title="Paste or upload a draft — PaperDock extracts every claim and batch-checks each against your papers."
+                >"Check draft"</button>
+                {move || (!answer.get().is_empty() || !history.get().is_empty()).then(|| view! {
+                    <button class="newchat"
+                        title="Start a fresh conversation — clears the current thread. Do this when you switch to a new topic, so a saved note stays one coherent conversation."
+                        on:click=move |_| new_chat()>"＋ New chat"</button>
+                })}
             </div>
 
             {move || (mode.get() == "check").then(|| view! {
@@ -851,8 +1099,8 @@ fn App() -> impl IntoView {
                 </select>
             })}
 
-            // Ask / Check input (hidden in Verify mode).
-            {move || (mode.get() != "verify").then(|| view! {
+            // Ask / Check input (Verify and Draft have their own inputs).
+            {move || (mode.get() == "ask" || mode.get() == "check").then(|| view! {
                 <div class="askrow">
                     <input class="ask" type="text"
                         placeholder=move || if mode.get() == "check" {
@@ -917,6 +1165,72 @@ fn App() -> impl IntoView {
                 }}
             })}
 
+            // Check-draft: textarea + batch results.
+            {move || (mode.get() == "draft").then(|| view! {
+                <div class="draftbox">
+                    <button class="draft-upload" title="Upload a .txt / .md / .tex / .pdf draft"
+                        prop:disabled=move || draft_running.get()
+                        on:click=move |_| pick_draft()>"📎 Upload a draft file"</button>
+                    <textarea class="draft-input"
+                        placeholder="…or paste a draft / paragraph — PaperDock extracts its claims and checks each against these papers."
+                        prop:value=move || draft_input.get()
+                        prop:disabled=move || draft_running.get()
+                        on:input=move |ev| draft_input.set(event_target_value(&ev))></textarea>
+                    <button class="draft-go" prop:disabled=move || draft_running.get()
+                        on:click=move |_| submit_draft()>
+                        {move || if draft_running.get() { "Checking…".to_string() } else { "Check draft".to_string() }}
+                    </button>
+                </div>
+                {move || {
+                    let items = draft_items.get();
+                    if items.is_empty() {
+                        return ().into_any();
+                    }
+                    let count = |v: &str| items.iter().filter(|i| i.verdict == v).count();
+                    let (sup, par, no, ins) = (
+                        count("SUPPORTED"), count("PARTIALLY SUPPORTED"),
+                        count("NOT SUPPORTED"), count("INSUFFICIENT EVIDENCE"),
+                    );
+                    let total = items.len().max(1);
+                    let w = |n: usize| format!("width:{}%", n * 100 / total);
+                    view! {
+                        <div class="draft-summary">
+                            <div class="bar">
+                                <span class="seg ok" style=w(sup)></span>
+                                <span class="seg par" style=w(par)></span>
+                                <span class="seg no" style=w(no)></span>
+                                <span class="seg ins" style=w(ins)></span>
+                            </div>
+                            <div class="legend">
+                                <span class="ok">{format!("{sup} supported")}</span>
+                                <span class="par">{format!("{par} partial")}</span>
+                                <span class="no">{format!("{no} unsupported")}</span>
+                                <span class="ins">{format!("{ins} insufficient")}</span>
+                            </div>
+                        </div>
+                        <div class="draft-list">
+                            {items.into_iter().map(|it| {
+                                let cls = match it.verdict.as_str() {
+                                    "SUPPORTED" => "dv ok",
+                                    "PARTIALLY SUPPORTED" => "dv par",
+                                    "NOT SUPPORTED" => "dv no",
+                                    _ => "dv ins",
+                                };
+                                view! {
+                                    <div class="draft-item">
+                                        <span class=cls>{it.verdict}</span>
+                                        <div class="di-body">
+                                            <div class="di-claim">{it.claim}</div>
+                                            <div class="di-detail">{it.detail}</div>
+                                        </div>
+                                    </div>
+                                }
+                            }).collect::<Vec<_>>()}
+                        </div>
+                    }.into_any()
+                }}
+            })}
+
             // Current question (shown above its streaming answer).
             {move || (!asked.get().is_empty())
                 .then(|| view! { <div class="turn-q">{asked.get()}</div> })}
@@ -955,6 +1269,55 @@ fn App() -> impl IntoView {
                 }}
                 {move || streaming.get().then(|| view! { <span class="cursor"></span> })}
             </div>
+
+            {move || (!answer.get().is_empty() && !streaming.get()).then(|| view! {
+                <button class="copy-note" title="Save the whole conversation as a note directly into Zotero (goes to the collection you have open in Zotero)"
+                    on:click=move |_| save_note()>"⌘ Save to Zotero note"</button>
+            })}
+            {move || (!save_msg.get().is_empty()).then(|| view! {
+                <div class="save-msg">
+                    <span>{move || save_msg.get()}</span>
+                    {move || (!saved_link.get().is_empty()).then(|| view! {
+                        <a class="save-open" href="#" on:click=move |ev: web_sys::MouseEvent| {
+                            ev.prevent_default();
+                            let l = saved_link.get();
+                            spawn_local(async move {
+                                let _ = invoke("open_zotero_uri", args(serde_json::json!({ "uri": l }))).await;
+                            });
+                        }>"Open in Zotero →"</a>
+                    })}
+                </div>
+            })}
+
+            {move || (!answer.get().is_empty() && !streaming.get()).then(|| {
+                if fb_rated.get() {
+                    view! { <div class="fb"><span class="fb-thanks">"Thanks — noted."</span></div> }.into_any()
+                } else if fb_ask.get() {
+                    view! { <div class="fb fb-consent">
+                        <span>"Send anonymous feedback to help improve PaperDock? Only your rating + research field — never your papers or questions."</span>
+                        <input class="fb-field" placeholder="Your field (e.g. clinical ML)"
+                            prop:value=move || fb_field.get()
+                            on:input=move |ev| fb_field.set(event_target_value(&ev)) />
+                        <button class="fb-yes" on:click=move |_| decide_consent(true)>"Allow & send"</button>
+                        <button class="fb-no" on:click=move |_| decide_consent(false)>"No thanks"</button>
+                    </div> }.into_any()
+                } else {
+                    view! { <div class="fb">
+                        <span class="fb-q">"Was this helpful?"</span>
+                        <button class="fb-btn" title="Helpful" on:click=move |_| rate("up".to_string())>"👍"</button>
+                        <button class="fb-btn" title="Not helpful" on:click=move |_| rate("down".to_string())>"👎"</button>
+                        <a class="fb-link" href="#" title="Open a GitHub issue"
+                            on:click=move |ev: web_sys::MouseEvent| {
+                                ev.prevent_default();
+                                spawn_local(async move {
+                                    let _ = invoke("open_url", args(serde_json::json!({
+                                        "url": "https://github.com/Chesterguan/PaperDock/issues/new"
+                                    }))).await;
+                                });
+                            }>"Send detailed feedback →"</a>
+                    </div> }.into_any()
+                }
+            })}
 
             <div class="refs">
                 // One tab per cited paper; the panel shows the active paper's

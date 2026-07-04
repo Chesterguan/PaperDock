@@ -36,6 +36,12 @@ pub struct Config {
     // desktop app; move to the macOS Keychain if that bar rises.
     #[serde(default)]
     pub api_key: Option<String>,
+    /// User's research field (coarse; the only dimension sent with feedback).
+    #[serde(default)]
+    pub field: String,
+    /// Anonymous-feedback opt-in. None = not asked yet, Some(true/false) = decided.
+    #[serde(default)]
+    pub tele_consent: Option<bool>,
 }
 
 fn default_embedding() -> String {
@@ -57,6 +63,8 @@ impl Default for Config {
             qdrant_url: None,
             qdrant_api_key: None,
             api_key: None,
+            field: String::new(),
+            tele_consent: None,
         }
     }
 }

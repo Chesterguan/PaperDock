@@ -16,8 +16,17 @@ pub enum AnswerEvent {
     References { items: Vec<RefItem> },
     /// A non-fatal heads-up (e.g. some papers had no PDF and were skipped).
     Notice { message: String },
+    /// Draft batch citation-check: per-claim verdicts.
+    Draft { claims: Vec<DraftItem> },
     Done,
     Error { message: String },
+}
+
+#[derive(Clone, serde::Serialize)]
+pub struct DraftItem {
+    pub claim: String,
+    pub verdict: String,
+    pub detail: String,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -219,6 +228,12 @@ async fn clear_slot(child_slot: &ChildSlot) {
 /// `python3` only if none is provisioned.
 fn python_for_worker(app: &tauri::AppHandle, worker_path: &str) -> String {
     resolve_python(app, worker_path).unwrap_or_else(|| "python3".to_string())
+}
+
+/// The provisioned Python interpreter (for one-off tasks like PDF text
+/// extraction). Same resolution as the worker uses.
+pub fn interpreter(app: &tauri::AppHandle, worker_path: &str) -> String {
+    python_for_worker(app, worker_path)
 }
 
 // ---- First-run Python environment provisioning -------------------------
@@ -482,6 +497,34 @@ fn parse_event(raw: &str) -> Option<AnswerEvent> {
                 })
                 .unwrap_or_default();
             Some(AnswerEvent::References { items })
+        }
+        "draft" => {
+            let items = v
+                .get("items")
+                .and_then(Value::as_array)
+                .map(|arr| {
+                    arr.iter()
+                        .map(|it| DraftItem {
+                            claim: it
+                                .get("claim")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            verdict: it
+                                .get("verdict")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                            detail: it
+                                .get("detail")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default()
+                                .to_string(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(AnswerEvent::Draft { claims: items })
         }
         "done" => Some(AnswerEvent::Done),
         "error" => Some(AnswerEvent::Error {

@@ -83,6 +83,57 @@ async fn check(
     spawn_worker(app, state, "check", library, collection_key, claim, String::new(), sk).await
 }
 
+/// Draft batch citation-check: extract claims from a pasted draft and judge each
+/// against the collection. Results arrive as a `draft` answer event.
+#[tauri::command]
+async fn check_draft(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    library: String,
+    collection_key: String,
+    draft: String,
+) -> Result<(), String> {
+    spawn_worker(app, state, "check_draft", library, collection_key, draft, String::new(), None).await
+}
+
+/// Pick a draft file (.txt/.md/.tex/.pdf) and return its text — for Check draft.
+#[tauri::command]
+async fn pick_draft_file(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let file = app
+        .dialog()
+        .file()
+        .add_filter("Draft", &["txt", "md", "markdown", "tex", "pdf"])
+        .blocking_pick_file();
+    let Some(file) = file else { return Ok(String::new()) };
+    let path = file
+        .into_path()
+        .map_err(|_| "Could not resolve the file path.".to_string())?;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    if ext == "pdf" {
+        let py = sidecar::interpreter(&app, &state.worker_path);
+        let out = std::process::Command::new(py)
+            .arg("-c")
+            .arg("import sys,pypdf;r=pypdf.PdfReader(sys.argv[1]);print('\\n'.join((p.extract_text() or '') for p in r.pages))")
+            .arg(&path)
+            .output()
+            .map_err(|_| "Could not read the PDF.".to_string())?;
+        if !out.status.success() {
+            return Err("Could not extract text from that PDF.".to_string());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+    } else {
+        std::fs::read_to_string(&path).map_err(|_| "Could not read the file.".to_string())
+    }
+}
+
 /// One checkable paper (has a PDF) in a collection — for the citation-check
 /// source picker.
 #[derive(serde::Serialize)]
@@ -439,6 +490,10 @@ struct UiConfig {
     /// True if a usable key exists (env var or saved), so the UI can hide the
     /// key prompt.
     has_api_key: bool,
+    /// User's research field (feedback dimension).
+    field: String,
+    /// Feedback opt-in: null = not asked, true/false = decided.
+    tele_consent: Option<bool>,
 }
 
 /// Open an external URL in the default browser (used for the PaperQA credit).
@@ -453,6 +508,138 @@ fn open_url(url: String) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|_| "Could not open the link.".to_string())
+}
+
+/// Put an HTML note on the clipboard (with a plain-text fallback) so pasting into
+/// a Zotero note — which is HTML rich text — renders nicely.
+#[tauri::command]
+fn copy_html(html: String, plain: String) -> Result<(), String> {
+    let mut cb = arboard::Clipboard::new().map_err(|_| "Could not access the clipboard.".to_string())?;
+    cb.set()
+        .html(html.as_str(), Some(plain.as_str()))
+        .map_err(|_| "Could not write to the clipboard.".to_string())?;
+    Ok(())
+}
+
+/// Where a note landed after saving to Zotero.
+#[derive(serde::Serialize)]
+struct SavedNote {
+    /// Library it went to (e.g. "My Library" or a group name).
+    location: String,
+    /// True if a shared group library (warn the user).
+    is_group: bool,
+    /// `zotero://select/...` link to open the note.
+    link: String,
+}
+
+/// Save an HTML note DIRECTLY into Zotero via the connector, then locate it to
+/// return where it landed + a `zotero://` link. Note: the connector saves to
+/// Zotero's currently-open collection (we can't override the target), so we
+/// report the destination and flag shared group libraries.
+#[tauri::command]
+async fn save_to_zotero(html: String) -> Result<SavedNote, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|_| "Could not start the save.".to_string())?;
+    let sid = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let save = client
+        .post("http://localhost:23119/connector/saveItems")
+        .header("X-Zotero-Connector-API-Version", "3")
+        .header("User-Agent", "PaperDock")
+        .json(&serde_json::json!({
+            "sessionID": format!("paperdock-{sid}"),
+            "items": [{ "itemType": "note", "note": html }],
+        }))
+        .send()
+        .await
+        .map_err(|_| "Zotero isn't reachable — make sure it's open.".to_string())?;
+    if !save.status().is_success() {
+        return Err("Zotero didn't accept the note.".to_string());
+    }
+    // Let Zotero persist, then find the just-created note (newest across libraries).
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+
+    // Candidate libraries: personal + each group.
+    let mut candidates: Vec<(String, String, bool)> =
+        vec![("users/0".to_string(), "My Library".to_string(), false)];
+    if let Ok(resp) = client
+        .get("http://localhost:23119/api/users/0/groups")
+        .send()
+        .await
+    {
+        if let Ok(v) = resp.json::<serde_json::Value>().await {
+            if let Some(arr) = v.as_array() {
+                for g in arr {
+                    if let (Some(id), Some(name)) = (
+                        g.get("id").and_then(|x| x.as_u64()),
+                        g.get("data")
+                            .and_then(|d| d.get("name"))
+                            .and_then(|n| n.as_str()),
+                    ) {
+                        candidates.push((format!("groups/{id}"), name.to_string(), true));
+                    }
+                }
+            }
+        }
+    }
+    // Pick the globally-newest note — that's the one we just created.
+    let mut best: Option<(String, SavedNote)> = None;
+    for (path, name, is_group) in &candidates {
+        let url = format!(
+            "http://localhost:23119/api/{path}/items?itemType=note&sort=dateAdded&direction=desc&limit=1"
+        );
+        let Ok(resp) = client.get(&url).send().await else { continue };
+        let Ok(v) = resp.json::<serde_json::Value>().await else { continue };
+        let Some(it) = v.as_array().and_then(|a| a.first()) else { continue };
+        let data = it.get("data");
+        let key = data
+            .and_then(|d| d.get("key"))
+            .and_then(|k| k.as_str())
+            .unwrap_or("");
+        let date = data
+            .and_then(|d| d.get("dateAdded"))
+            .and_then(|k| k.as_str())
+            .unwrap_or("");
+        if key.is_empty() {
+            continue;
+        }
+        let link = if *is_group {
+            let gid = path.trim_start_matches("groups/");
+            format!("zotero://select/groups/{gid}/items/{key}")
+        } else {
+            format!("zotero://select/library/items/{key}")
+        };
+        let newer = best.as_ref().map(|(d, _)| date > d.as_str()).unwrap_or(true);
+        if newer {
+            best = Some((
+                date.to_string(),
+                SavedNote {
+                    location: name.clone(),
+                    is_group: *is_group,
+                    link,
+                },
+            ));
+        }
+    }
+    best.map(|(_, n)| n)
+        .ok_or_else(|| "Saved to Zotero, but couldn't locate the note.".to_string())
+}
+
+/// Open a `zotero://` link (used to jump to a saved note).
+#[tauri::command]
+fn open_zotero_uri(uri: String) -> Result<(), String> {
+    if !uri.starts_with("zotero://") {
+        return Err("Not a Zotero link.".to_string());
+    }
+    std::process::Command::new("open")
+        .arg(uri)
+        .spawn()
+        .map(|_| ())
+        .map_err(|_| "Could not open Zotero.".to_string())
 }
 
 /// Return the frontend-safe config (no secrets).
@@ -472,7 +659,47 @@ fn get_config(state: State<'_, AppState>) -> UiConfig {
             .as_deref()
             .is_some_and(|k| !k.trim().is_empty()),
         has_api_key: has_saved || has_env,
+        field: cfg.field,
+        tele_consent: cfg.tele_consent,
     }
+}
+
+/// URL of the feedback collector (a Cloudflare Worker on *.workers.dev).
+/// Empty = telemetry disabled at build time; feedback POSTs are skipped.
+const FEEDBACK_URL: &str = "https://paperdock-feedback.chesterfield199512.workers.dev";
+
+/// Record a 👍/👎 on the last answer. Persists the user's consent + field, and
+/// (only with consent + a configured collector) POSTs a minimal, content-free
+/// event: rating, coarse field, app version. Never sends papers or questions.
+#[tauri::command]
+async fn submit_feedback(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    rating: String,
+    field: String,
+    consent: bool,
+) -> Result<(), String> {
+    {
+        let mut cfg = state.config.lock().map_err(|_| "config".to_string())?;
+        cfg.field = field.clone();
+        cfg.tele_consent = Some(consent);
+        let _ = cfg.save(&app);
+    }
+    if consent && !FEEDBACK_URL.is_empty() {
+        let body = serde_json::json!({
+            "rating": rating,
+            "field": field,
+            "version": env!("CARGO_PKG_VERSION"),
+        });
+        // Fire-and-forget; a failed send must never disrupt the user.
+        if let Ok(client) = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(6))
+            .build()
+        {
+            let _ = client.post(FEEDBACK_URL).json(&body).send().await;
+        }
+    }
+    Ok(())
 }
 
 /// Save the LiteLLM API key entered in the UI (empty string clears it).
@@ -672,8 +899,14 @@ pub fn run() {
             list_collections,
             ask,
             check,
+            check_draft,
+            pick_draft_file,
             list_collection_papers,
             verify_reference,
+            copy_html,
+            save_to_zotero,
+            open_zotero_uri,
+            submit_feedback,
             index_collection,
             cancel,
             env_status,
