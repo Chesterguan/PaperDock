@@ -243,6 +243,8 @@ mod tests {
             qdrant_url: Some("https://q.example".into()),
             qdrant_api_key: Some("QKEY".into()),
             api_key: Some("LLMKEY".into()),
+            field: String::new(),
+            tele_consent: None,
         }
     }
 

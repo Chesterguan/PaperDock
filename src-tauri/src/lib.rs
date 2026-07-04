@@ -629,6 +629,75 @@ async fn save_to_zotero(html: String) -> Result<SavedNote, String> {
         .ok_or_else(|| "Saved to Zotero, but couldn't locate the note.".to_string())
 }
 
+/// Whether a newer release exists on GitHub.
+#[derive(serde::Serialize)]
+struct UpdateInfo {
+    available: bool,
+    version: String,
+    url: String,
+}
+
+/// True if `latest` is a higher dotted version than `current` (e.g. 0.3.1 > 0.3.0).
+fn version_gt(latest: &str, current: &str) -> bool {
+    let parse = |s: &str| {
+        s.split('.')
+            .map(|p| p.trim().parse::<u32>().unwrap_or(0))
+            .collect::<Vec<_>>()
+    };
+    let (l, c) = (parse(latest), parse(current));
+    for i in 0..l.len().max(c.len()) {
+        let (a, b) = (l.get(i).copied().unwrap_or(0), c.get(i).copied().unwrap_or(0));
+        if a != b {
+            return a > b;
+        }
+    }
+    false
+}
+
+/// Check GitHub Releases for a newer PaperDock. Best-effort — any failure just
+/// reports "no update". Nothing is downloaded; the UI links to the release.
+#[tauri::command]
+async fn check_update() -> Result<UpdateInfo, String> {
+    let current = env!("CARGO_PKG_VERSION");
+    let fallback = UpdateInfo {
+        available: false,
+        version: current.to_string(),
+        url: "https://github.com/Chesterguan/PaperDock/releases/latest".to_string(),
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .user_agent("PaperDock")
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return Ok(fallback),
+    };
+    let resp = client
+        .get("https://api.github.com/repos/Chesterguan/PaperDock/releases/latest")
+        .send()
+        .await;
+    let Ok(resp) = resp else { return Ok(fallback) };
+    let Ok(v) = resp.json::<serde_json::Value>().await else {
+        return Ok(fallback);
+    };
+    let tag = v
+        .get("tag_name")
+        .and_then(|t| t.as_str())
+        .unwrap_or("")
+        .trim_start_matches('v')
+        .to_string();
+    let url = v
+        .get("html_url")
+        .and_then(|u| u.as_str())
+        .unwrap_or(&fallback.url)
+        .to_string();
+    Ok(UpdateInfo {
+        available: version_gt(&tag, current),
+        version: tag,
+        url,
+    })
+}
+
 /// Open a `zotero://` link (used to jump to a saved note).
 #[tauri::command]
 fn open_zotero_uri(uri: String) -> Result<(), String> {
@@ -906,6 +975,7 @@ pub fn run() {
             copy_html,
             save_to_zotero,
             open_zotero_uri,
+            check_update,
             submit_feedback,
             index_collection,
             cancel,
@@ -934,4 +1004,18 @@ pub fn run() {
                 }
             }
         });
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::version_gt;
+    #[test]
+    fn newer_versions() {
+        assert!(version_gt("0.3.1", "0.3.0"));
+        assert!(version_gt("0.4.0", "0.3.9"));
+        assert!(version_gt("1.0.0", "0.9.9"));
+        assert!(!version_gt("0.3.0", "0.3.0"));
+        assert!(!version_gt("0.2.9", "0.3.0"));
+        assert!(!version_gt("", "0.3.0"));
+    }
 }

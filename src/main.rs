@@ -119,6 +119,13 @@ struct SavedNote {
     link: String,
 }
 
+#[derive(Clone, Deserialize)]
+struct UpdateInfo {
+    available: bool,
+    version: String,
+    url: String,
+}
+
 /// Pull the fraction from a "…paper 3/12…" progress status, if present.
 fn parse_frac(s: &str) -> Option<f64> {
     let slash = s.find('/')?;
@@ -239,6 +246,8 @@ fn App() -> impl IntoView {
     let toast = RwSignal::new(String::new()); // transient confirmation
     let saved_link = RwSignal::new(String::new()); // zotero:// link of the last saved note
     let save_msg = RwSignal::new(String::new()); // inline Save-to-Zotero result (under the button)
+    let update_ver = RwSignal::new(String::new()); // newer release version, if any
+    let update_url = RwSignal::new(String::new()); // its release page
 
     // ---- single "answer" event listener, wired once at startup ----------
     {
@@ -418,6 +427,18 @@ fn App() -> impl IntoView {
             }
         });
     };
+
+    // ---- startup: check GitHub for a newer release (best-effort, non-blocking) --
+    spawn_local(async move {
+        if let Ok(v) = invoke("check_update", args(serde_json::json!({}))).await {
+            if let Ok(u) = serde_wasm_bindgen::from_value::<UpdateInfo>(v) {
+                if u.available {
+                    update_ver.set(u.version);
+                    update_url.set(u.url);
+                }
+            }
+        }
+    });
 
     // ---- startup: read config, then poll Zotero until it's up -----------
     spawn_local(async move {
@@ -853,6 +874,19 @@ fn App() -> impl IntoView {
     // ---- view -----------------------------------------------------------
     view! {
         <main class="app">
+            {move || (!update_ver.get().is_empty()).then(|| view! {
+                <div class="updbar">
+                    <span>{move || format!("PaperDock v{} is available", update_ver.get())}</span>
+                    <a class="updbar-dl" href="#" on:click=move |ev: web_sys::MouseEvent| {
+                        ev.prevent_default();
+                        let u = update_url.get();
+                        spawn_local(async move {
+                            let _ = invoke("open_url", args(serde_json::json!({ "url": u }))).await;
+                        });
+                    }>"Download →"</a>
+                    <button class="updbar-x" title="Dismiss" on:click=move |_| update_ver.set(String::new())>"×"</button>
+                </div>
+            })}
             <header class="topbar">
                 <div class="brand">
                     <svg class="logo" viewBox="0 0 24 24" fill="none"
