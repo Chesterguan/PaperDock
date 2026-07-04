@@ -110,9 +110,22 @@
   .foot-links a{color:var(--dim);transition:color .18s}.foot-links a:hover{color:var(--accent)}
   .foot-bot{margin-top:34px;font-family:var(--mono);font-size:11.5px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:10px}
 
+  .downloads{display:grid;grid-template-columns:1.15fr 1fr;gap:20px;align-items:stretch}
+  .dl{display:flex;flex-direction:column;padding:24px;border:1px solid var(--line);border-radius:14px;background:var(--raised);text-decoration:none;transition:border-color .18s,transform .18s}
+  .dl:hover{border-color:var(--line-hi);transform:translateY(-2px)}
+  .dl-primary{border-color:var(--accent-line);background:linear-gradient(180deg,var(--accent-soft),var(--raised) 60%)}
+  .dl-primary:hover{border-color:var(--accent)}
+  .dl-head{display:flex;align-items:baseline;gap:10px;margin-bottom:14px}
+  .dl-v{font-family:var(--serif);font-size:1.9rem;color:var(--text);line-height:1}
+  .dl-tag{font-family:var(--mono);font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:var(--accent);border:1px solid var(--accent-line);border-radius:20px;padding:2px 9px}
+  .dl-feat{list-style:none;padding:0;margin:0 0 20px;display:grid;gap:8px;font-size:13.5px;color:var(--dim);line-height:1.45}
+  .dl-feat li{padding-left:16px;position:relative}
+  .dl-feat li::before{content:"·";position:absolute;left:2px;color:var(--accent)}
+  .dl-feat b{color:var(--text);font-weight:600}
+  .dl-cta{margin-top:auto;font-family:var(--mono);font-size:13px;color:var(--accent)}
   @media (max-width:760px){
     .modes,.prin{grid-template-columns:1fr}
-    .install{grid-template-columns:1fr}
+    .install,.downloads{grid-template-columns:1fr}
     .nav-links{display:none}
   }
 </style>
@@ -211,6 +224,35 @@
     </div>
   </section>
 
+  <section id="download">
+    <div class="sec-label">Download · choose by features</div>
+    <div class="downloads">
+      <a class="dl dl-primary" href="https://github.com/Chesterguan/PaperDock/releases/download/v0.3.0/PaperDock_0.3.0_universal.dmg">
+        <div class="dl-head"><span class="dl-v">v0.3</span><span class="dl-tag">latest</span></div>
+        <ul class="dl-feat">
+          <li>Save answers as <b>Zotero notes</b> — written straight into your library</li>
+          <li><b>Check draft</b> — batch-verify every claim in a paragraph or file</li>
+          <li>Ask · Check citation · Verify reference</li>
+          <li>New-conversation threading · optional anonymous 👍/👎</li>
+        </ul>
+        <span class="dl-cta">Download for macOS →</span>
+      </a>
+      <a class="dl" href="https://github.com/Chesterguan/PaperDock/releases/download/v0.2.0/PaperDock_0.2.0_universal.dmg">
+        <div class="dl-head"><span class="dl-v">v0.2</span></div>
+        <ul class="dl-feat">
+          <li>Ask · Check citation · Verify reference</li>
+          <li>Copy an answer as a note (you paste it yourself)</li>
+          <li>No writing into Zotero · no telemetry</li>
+        </ul>
+        <span class="dl-cta">Download →</span>
+      </a>
+    </div>
+    <p style="color:var(--faint);font-size:12px;margin-top:16px">
+      Universal build — Apple Silicon &amp; Intel. Both are open source and ship
+      without keys; bring your own LLM.
+    </p>
+  </section>
+
   <section>
     <div class="sec-label">Get started</div>
     <div class="install">
@@ -274,7 +316,7 @@
         <a href="https://github.com/Future-House/paper-qa" style="color:var(--dim);text-decoration:underline;text-underline-offset:2px">PaperQA</a>.
       </p>
       <div class="foot-links">
-        <a href="https://github.com/Chesterguan/PaperDock/releases/download/v0.2.0/PaperDock_0.2.0_universal.dmg">Download v0.2.0</a>
+        <a href="#download">Download</a>
         <a href="https://github.com/Chesterguan/PaperDock">Source on GitHub</a>
         <a href="https://github.com/Chesterguan/PaperDock/blob/main/ROADMAP.md">Roadmap</a>
         <a href="https://github.com/Chesterguan/PaperDock/blob/main/CONTRIBUTING.md">Contributing</a>
