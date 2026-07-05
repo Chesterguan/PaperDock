@@ -32,8 +32,11 @@ typing matters.
 import asyncio
 import json
 import os
+import re
 import sys
 import time
+import xml.etree.ElementTree as ET
+import zipfile
 
 
 def send(obj):
@@ -105,7 +108,7 @@ async def _aquery_with_retry(docs, question, settings):
             raise
 
 
-# Verdict prompt shared by Check-citation and Check-draft. Uses only
+# Verdict prompt shared by single-claim check and manuscript audit. Uses only
 # {question}/{context}/{example_citation}; PaperQA passes extra format kwargs
 # which str.format() harmlessly ignores.
 CHECK_QA = (
@@ -132,6 +135,352 @@ def verdict_of(text):
     return "INSUFFICIENT EVIDENCE"
 
 
+# ---------------------------------------------------------------------------
+# Manuscript parsing — turn a .docx / .tex into (claim, cited paper) rows.
+# Stdlib only. Each row: {"claim": str, "keys": [zotero_key], "cites_raw": [str],
+# and (.tex only) "dois": [str]}.
+# ---------------------------------------------------------------------------
+_W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_ZOTERO_KEY = re.compile(r"zotero\.org/(?:users|groups)/\d+/items/([A-Z0-9]+)")
+
+
+def _para_text_and_fields(p):
+    """Return (visible_text, [instrText strings]) for one <w:p> element."""
+    texts, fields = [], []
+    for node in p.iter():
+        if node.tag == _W + "t" and node.text:
+            texts.append(node.text)
+        elif node.tag == _W + "instrText" and node.text:
+            fields.append(node.text)
+    return "".join(texts), fields
+
+
+def parse_docx(path):
+    """Extract (claim, Zotero keys) from a Word doc whose citations were
+    inserted with the Zotero plugin (field code `ADDIN ZOTERO_ITEM CSL_CITATION
+    {json}`). A claim is a paragraph that carries at least one citation."""
+    with zipfile.ZipFile(path) as z:
+        xml = z.read("word/document.xml")
+    root = ET.fromstring(xml)
+    rows = []
+    for p in root.iter(_W + "p"):
+        text, fields = _para_text_and_fields(p)
+        claim = " ".join(text.split()).strip()
+        if not claim:
+            continue
+        keys, raw = [], []
+        for f in fields:
+            if "ZOTERO_ITEM" not in f:
+                continue
+            for k in _ZOTERO_KEY.findall(f):
+                if k not in keys:
+                    keys.append(k)
+            m = re.search(r"\{.*\}", f, re.S)  # CSL JSON → human citation fallback
+            if m:
+                try:
+                    data = json.loads(m.group(0))
+                    for ci in data.get("citationItems", []):
+                        t = (ci.get("itemData") or {}).get("title")
+                        if t and t not in raw:
+                            raw.append(t)
+                except Exception:
+                    pass
+        if keys or raw:
+            rows.append({"claim": claim, "keys": keys, "cites_raw": raw})
+    return rows
+
+
+_BIB_ENTRY = re.compile(r"@\w+\s*\{\s*([^,]+),(.*?)\n\}", re.S)
+_BIB_FIELD = re.compile(r"(\w+)\s*=\s*[{\"]((?:[^{}]|\{[^{}]*\})*)[}\"]", re.S)
+_CITE = re.compile(r"\\cite[a-zA-Z]*\*?(?:\[[^\]]*\])*\{([^}]*)\}")
+# Any remaining LaTeX control sequence (with optional [opt] and {arg}), so a
+# claim sentence reads as prose, not markup (\documentclass{…}, \section{…}, …).
+_LATEX_CMD = re.compile(r"\\[a-zA-Z@]+\*?(?:\[[^\]]*\])*(?:\{[^{}]*\})?")
+
+
+def _parse_bib(path):
+    """bibkey -> {'doi','title','author','year', ...} (lowercased field names)."""
+    out = {}
+    if not path or not os.path.exists(path):
+        return out
+    with open(path, encoding="utf-8", errors="ignore") as fh:
+        txt = fh.read()
+    for key, body in _BIB_ENTRY.findall(txt):
+        fields = {k.lower(): " ".join(v.split())
+                  for k, v in _BIB_FIELD.findall(body)}
+        out[key.strip()] = fields
+    return out
+
+
+def _split_sentences(text):
+    """Naive sentence split — adequate for locating which sentence a \\cite sits in."""
+    return re.split(r"(?<=[.!?])\s+(?=[A-Z\\])", text)
+
+
+def parse_tex(tex_path, bib_path=None):
+    """Extract (claim, DOIs) from LaTeX: each sentence containing a \\cite is a
+    claim; bibkeys are resolved to DOI/title via the .bib."""
+    bib = _parse_bib(bib_path)
+    with open(tex_path, encoding="utf-8", errors="ignore") as fh:
+        text = fh.read()
+    text = re.sub(r"(?<!\\)%.*", "", text)  # strip line comments
+    # Restrict to the document body if the markers exist (drops the preamble).
+    m = re.search(r"\\begin\{document\}(.*?)(?:\\end\{document\}|$)", text, re.S)
+    if m:
+        text = m.group(1)
+    rows = []
+    for sent in _split_sentences(text):
+        bibkeys = [k.strip() for grp in _CITE.findall(sent)
+                   for k in grp.split(",") if k.strip()]
+        if not bibkeys:
+            continue
+        # Remove the \cite, then any other LaTeX command, then stray braces.
+        claim = _CITE.sub("", sent)
+        claim = _LATEX_CMD.sub(" ", claim)
+        claim = " ".join(claim.replace("{", " ").replace("}", " ").split()).strip()
+        if not claim:
+            continue
+        dois, raw = [], []
+        for bk in bibkeys:
+            f = bib.get(bk, {})
+            if f.get("doi"):
+                dois.append(f["doi"])
+            title = f.get("title")
+            if title:
+                yr = f.get("year", "")
+                au = (f.get("author", "").split(",")[0] or "").strip()
+                raw.append(" ".join(x for x in (au, yr, title) if x))
+            elif not f:
+                raw.append(bk)  # unresolved bibkey — still surface it
+        rows.append({"claim": claim, "keys": [], "dois": dois, "cites_raw": raw})
+    return rows
+
+
+def handle_parse(req):
+    """cmd:"parse" — no LLM, fast. Emits a `claims` event then `done`."""
+    qid = req["id"]
+    path = req.get("path") or ""
+    try:
+        if path.lower().endswith(".docx"):
+            items = parse_docx(path)
+        elif path.lower().endswith((".tex", ".latex")):
+            items = parse_tex(path, req.get("bib_path"))
+        else:
+            send({"id": qid, "type": "error",
+                  "message": "Import a .docx or .tex file."})
+            return
+    except Exception as exc:
+        sys.stderr.write("parse failed: %r\n" % exc)
+        send({"id": qid, "type": "error",
+              "message": "Couldn't read that file — is it a valid .docx/.tex?"})
+        return
+    if not items:
+        send({"id": qid, "type": "error",
+              "message": "No cited claims found. (Word: citations must be inserted "
+                         "with the Zotero plugin, not typed by hand.)"})
+        return
+    # Number the claims so the UI and audit results line up by index.
+    for i, it in enumerate(items):
+        it["idx"] = i
+    send({"id": qid, "type": "claims", "items": items})
+    send({"id": qid, "type": "done"})
+
+
+# ---------------------------------------------------------------------------
+# Shared setup (used by ask/check/index and audit) — DRY the env + Settings.
+# ---------------------------------------------------------------------------
+def _prep_env(req):
+    """Set the LLM env from the request; return a human 'missing key' message or
+    None. Uses the UI key only when OPENAI_API_KEY isn't already set, and points
+    LiteLLM at a gateway/self-hosted backend when api_base is given."""
+    model = req.get("model") or "gpt-4o"
+    embedding = req.get("embedding") or "text-embedding-3-small"
+    api_base = (req.get("api_base") or "").strip()
+    ui_key = (req.get("api_key") or "").strip()
+    if ui_key and not os.environ.get("OPENAI_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = ui_key
+    if api_base:
+        os.environ.setdefault("OLLAMA_API_BASE", api_base)
+        os.environ.setdefault("OPENAI_API_BASE", api_base)
+        os.environ.setdefault("OPENAI_BASE_URL", api_base)
+    return _missing_key_message(model, embedding)
+
+
+def _build_settings(req):
+    """Build a paperqa Settings from a request: point all four model roles at the
+    configured model, text-only parsing, generous timeout for gateways, lean mode
+    for slow local models, and the check-verdict prompt for check/audit."""
+    model = req.get("model") or "gpt-4o"
+    embedding = req.get("embedding") or "text-embedding-3-small"
+    api_base = (req.get("api_base") or "").strip()
+    cmd = req.get("cmd")
+    from paperqa import Settings
+    from paperqa.settings import MultimodalOptions
+    settings = Settings(llm=model, summary_llm=model, embedding=embedding,
+                        temperature=0.0)
+    settings.verbosity = 0
+    settings.parsing.enrichment_llm = model
+    settings.agent.agent_llm = model
+    settings.parsing.multimodal = MultimodalOptions.OFF
+    if api_base:
+        import litellm
+        litellm.request_timeout = 600
+    if model.startswith("ollama/"):
+        settings.answer.evidence_skip_summary = True
+        settings.answer.evidence_k = 8
+        settings.answer.answer_max_sources = 6
+    settings.parsing.use_doc_details = False
+    # Multi-turn history → answer prompt only (retrieval stays on the clean query).
+    history_text = (req.get("history") or "").strip()
+    if history_text and cmd != "index":
+        safe = history_text.replace("{", "{{").replace("}", "}}")
+        settings.prompts.qa = (
+            "Earlier in this conversation (context; the user may refer back to "
+            "it):\n" + safe + "\n\n" + settings.prompts.qa)
+    # Check/audit judge SUPPORT instead of answering.
+    if cmd in ("check", "audit"):
+        settings.prompts.qa = CHECK_QA
+    return settings
+
+
+# ---------------------------------------------------------------------------
+# Manuscript audit — verify each claim against ONLY the paper it cites.
+# Approach A: one single-paper Docs per cited paper (scoped retrieval), cached
+# locally per (zotero_key, embedding) and reused across claims and re-audits.
+# ---------------------------------------------------------------------------
+async def _build_one_doc(doc, settings, cache_dir):
+    """Build (or load from local cache) a single-paper Docs. Returns the Docs, or
+    None if the PDF is missing/unreadable. Per-paper cache = embed once, reuse."""
+    import hashlib
+    import pickle
+    from paperqa import Docs
+    key = doc.get("zotero_key") or ""
+    digest = hashlib.sha1(
+        (key + "@" + str(settings.embedding)).encode()).hexdigest()[:16]
+    cache_file = os.path.join(cache_dir, "paper_%s.pkl" % digest)
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "rb") as fh:
+                return pickle.load(fh)
+        except Exception as exc:
+            sys.stderr.write("paper cache load failed: %r\n" % exc)
+    path = doc.get("path")
+    if not path or not os.path.exists(path):
+        return None
+    d = Docs()
+    try:
+        await d.aadd(path, citation=doc.get("citation"),
+                     docname=doc.get("citation") or key, dockey=key,
+                     settings=settings)
+    except Exception as exc:
+        sys.stderr.write("audit add failed for %s: %r\n" % (path, exc))
+        return None
+    if not d.docs:
+        return None
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+        with open(cache_file, "wb") as fh:
+            pickle.dump(d, fh)
+    except Exception as exc:
+        sys.stderr.write("paper cache save failed: %r\n" % exc)
+    return d
+
+
+async def _verify_one(claim, key, docs_for_key, settings):
+    """Verdict for one claim against ONE cited paper's Docs (scoped retrieval)."""
+    try:
+        session = await docs_for_key.aquery(claim, settings=settings)
+        ans = (session.answer or "").strip()
+        passages = []
+        for ctx in getattr(session, "contexts", [])[:2]:
+            t = getattr(ctx, "text", None)
+            name = getattr(t, "name", "") or ""
+            page = name.split(" pages ", 1)[1].strip() if " pages " in name else ""
+            snip = " ".join((getattr(ctx, "context", None)
+                             or getattr(t, "text", "") or "").split())[:400]
+            if snip:
+                passages.append({"page": page, "snippet": snip})
+    except Exception as exc:
+        sys.stderr.write("verify failed (%s): %r\n" % (key, exc))
+        return {"verdict": "INSUFFICIENT EVIDENCE",
+                "detail": "Could not verify this claim.", "passages": []}
+    v = verdict_of(ans)
+    # Drop the leading verdict label the LLM echoes so `detail` is just the reason.
+    body = ans.strip()
+    for lbl in ("PARTIALLY SUPPORTED", "NOT SUPPORTED", "INSUFFICIENT EVIDENCE",
+                "SUPPORTED"):
+        if body.upper().startswith(lbl):
+            body = body[len(lbl):].lstrip(" :.-–\n")
+            break
+    return {"verdict": v, "detail": " ".join(body.split())[:240], "passages": passages}
+
+
+async def _run_audit(claims, docs_by_key, settings, concurrency=4, on_result=None):
+    """Verify each claim against its cited paper, bounded-concurrent. Independent
+    per claim, so parallelism is a pure wall-clock win. Claims whose paper has no
+    usable Docs are skipped here (Rust/UI already flagged them Tier-A-only)."""
+    sem = asyncio.Semaphore(max(1, concurrency))
+    results = []
+
+    async def one(c):
+        async with sem:
+            r = await _verify_one(c["claim"], c["key"], docs_by_key[c["key"]],
+                                  settings)
+            r["idx"] = c["idx"]
+            results.append(r)
+            if on_result:
+                on_result(r)
+
+    await asyncio.gather(*(one(c) for c in claims if c.get("key") in docs_by_key))
+    return results
+
+
+async def handle_audit(req):
+    """cmd:"audit" — index each cited paper once, verify every claim concurrently,
+    stream one `claim_result` per claim."""
+    qid = req["id"]
+    claims = req.get("claims") or []
+    docs_in = req.get("docs") or []
+    model = req.get("model") or "gpt-4o"
+    cache_dir = req.get("cache_dir") or os.path.join(
+        os.path.expanduser("~"), ".paperdock_cache")
+    if not claims:
+        send({"id": qid, "type": "error", "message": "No claims to audit."})
+        return
+    missing = _prep_env(req)
+    if missing:
+        send({"id": qid, "type": "error", "message": missing})
+        return
+    settings = _build_settings(req)
+
+    by_key = {d.get("zotero_key"): d for d in docs_in}
+    needed = sorted({c.get("key") for c in claims if c.get("key")})
+    docs_by_key = {}
+    for i, key in enumerate(needed, 1):
+        doc = by_key.get(key)
+        if not doc:
+            continue
+        send({"id": qid, "type": "status",
+              "text": "Indexing cited paper %d/%d…" % (i, len(needed))})
+        d = await _build_one_doc(doc, settings, cache_dir)
+        if d is not None:
+            docs_by_key[key] = d
+
+    if not docs_by_key:
+        send({"id": qid, "type": "error",
+              "message": "Could not read any of the cited PDFs."})
+        return
+
+    concurrency = 1 if model.startswith("ollama/") else 4
+
+    def emit(r):
+        send({"id": qid, "type": "claim_result", **r})
+
+    send({"id": qid, "type": "status", "text": "Checking claims…"})
+    await _run_audit(claims, docs_by_key, settings, concurrency, on_result=emit)
+    send({"id": qid, "type": "done"})
+
+
 async def answer_real(req):
     qid = req["id"]
     index_only = req.get("cmd") == "index"  # pre-embed into Qdrant, no LLM query
@@ -151,87 +500,14 @@ async def answer_real(req):
         send({"id": qid, "type": "error", "message": "Please type a question."})
         return
 
-    # Use the key entered in the UI only when the env var isn't already set.
-    ui_key = (req.get("api_key") or "").strip()
-    if ui_key and not os.environ.get("OPENAI_API_KEY"):
-        os.environ["OPENAI_API_KEY"] = ui_key
-
-    # Point LiteLLM at a self-hosted / gateway backend if given. Ollama models
-    # read OLLAMA_API_BASE; an OpenAI-compatible gateway (e.g. UF Navigator at
-    # https://api.ai.it.ufl.edu/v1, used via openai/<model>) reads OPENAI_API_BASE.
-    # Set both — LiteLLM only consults the one matching the model prefix.
-    if api_base:
-        os.environ.setdefault("OLLAMA_API_BASE", api_base)
-        os.environ.setdefault("OPENAI_API_BASE", api_base)
-        os.environ.setdefault("OPENAI_BASE_URL", api_base)
-
-    missing = _missing_key_message(model, embedding)
+    # Env (LLM key + gateway base) and Settings are shared with the audit path.
+    missing = _prep_env(req)
     if missing:
         send({"id": qid, "type": "error", "message": missing})
         return
 
-    from paperqa import Docs, Settings
-
-    settings = Settings(
-        llm=model,
-        summary_llm=model,
-        embedding=embedding,
-        temperature=0.0,
-    )
-    settings.verbosity = 0
-    # PaperQA has FOUR model roles that each default to gpt-4o — point every one
-    # at the configured model, else a local (Ollama) setup still tries to reach
-    # OpenAI for enrichment/agent calls and fails with "missing credentials".
-    settings.parsing.enrichment_llm = model
-    settings.agent.agent_llm = model
-    # Text-only parsing: the default sends PDF figures/tables to a *vision* LLM,
-    # which needs a multimodal model (and pillow). Off = pure text RAG that works
-    # with any local text model, is faster, and drops the image dependency.
-    from paperqa.settings import MultimodalOptions
-    settings.parsing.multimodal = MultimodalOptions.OFF
-
-    # Local models are slow per call. PaperQA's default does one summary LLM call
-    # per retrieved chunk (evidence_k=10) plus the answer — ~11 calls. On a local
-    # model each call can exceed the 60s LiteLLM timeout. For local backends skip
-    # the per-chunk summary (raw passages go to the answer) and retrieve fewer
-    # chunks, collapsing it to ~1 call, and raise the timeout generously.
-    if api_base:
-        # Any custom backend can be slower than OpenAI — give it room.
-        import litellm
-        litellm.request_timeout = 600
-    if model.startswith("ollama/"):
-        # Genuinely-slow local models: skip the per-chunk summary LLM call
-        # (raw passages go straight to the answer) and retrieve a bit less,
-        # collapsing ~11 calls to ~1. A fast gateway (Navigator) keeps summaries.
-        settings.answer.evidence_skip_summary = True
-        settings.answer.evidence_k = 8
-        settings.answer.answer_max_sources = 6
-    # We already supply citation + dockey per doc (mapped to Zotero), so skip
-    # PaperQA's per-doc metadata LLM call — saves a request per paper and the
-    # "Failed to parse … citation" noise.
-    settings.parsing.use_doc_details = False
-
-    # Multi-turn: give the ANSWER LLM the last couple of Q&A turns so follow-ups
-    # ("that method", "why?") resolve. Injected into the answer prompt only —
-    # retrieval still runs on the clean question below, so old topics don't
-    # pollute the PDF evidence search.
-    # ponytail: 2-turn cap is enforced frontend-side; brace-escape here so LaTeX
-    # or JSON braces in a prior answer can't break the qa template's .format().
-    history_text = (req.get("history") or "").strip()
-    if history_text and not index_only:
-        safe = history_text.replace("{", "{{").replace("}", "}}")
-        settings.prompts.qa = (
-            "Earlier in this conversation (context; the user may refer back to "
-            "it):\n" + safe + "\n\n" + settings.prompts.qa
-        )
-
-    # Citation-check mode: reuse the whole embed+retrieve pipeline, but the
-    # `question` is a CLAIM and the answer LLM judges SUPPORT instead of
-    # answering. Swap the qa prompt for a verdict prompt (retrieval still runs
-    # on the clean claim). Uses only {question}/{context}/{example_citation};
-    # PaperQA passes extra format kwargs, which str.format() harmlessly ignores.
-    if req.get("cmd") in ("check", "check_draft"):
-        settings.prompts.qa = CHECK_QA
+    from paperqa import Docs
+    settings = _build_settings(req)
 
     # Where does the vector index live?
     #  - Qdrant Cloud (if configured): a SHARED index, scoped per Zotero
@@ -353,52 +629,6 @@ async def answer_real(req):
         send({"id": qid, "type": "done"})
         return
 
-    # Draft batch check: pull the checkable claims out of a pasted draft, then
-    # judge each against the collection. Emits one "draft" result + counts.
-    if req.get("cmd") == "check_draft":
-        import re as _re
-        import litellm
-        draft = question[:20000]
-        send({"id": qid, "type": "status", "text": "Extracting claims…"})
-        ex_prompt = (
-            "Extract up to 8 checkable factual claims from the text below. "
-            "Return ONLY a JSON array of short standalone sentences — no prose, "
-            "no numbering.\n\nText:\n" + draft
-        )
-        claims = []
-        try:
-            r = await litellm.acompletion(
-                model=model, temperature=0.0,
-                api_base=(api_base or None),
-                messages=[{"role": "user", "content": ex_prompt}])
-            raw = r["choices"][0]["message"]["content"]
-            m = _re.search(r"\[.*\]", raw, _re.S)
-            if m:
-                claims = [str(c).strip() for c in json.loads(m.group(0))
-                          if str(c).strip()]
-        except Exception as exc:
-            sys.stderr.write("claim extract failed: %r\n" % exc)
-        claims = claims[:8]
-        if not claims:
-            send({"id": qid, "type": "error",
-                  "message": "Couldn't find checkable claims in that text."})
-            return
-        items = []
-        for i, claim in enumerate(claims, 1):
-            send({"id": qid, "type": "status",
-                  "text": "Checking claim %d/%d…" % (i, len(claims))})
-            try:
-                session = await docs.aquery(claim, settings=settings)
-                ans = (session.answer or "").strip()
-            except Exception as exc:
-                ans = "INSUFFICIENT EVIDENCE"
-                sys.stderr.write("draft claim failed: %r\n" % exc)
-            items.append({"claim": claim, "verdict": verdict_of(ans),
-                          "detail": " ".join(ans.split())[:240]})
-        send({"id": qid, "type": "draft", "items": items})
-        send({"id": qid, "type": "done"})
-        return
-
     send({"id": qid, "type": "status",
           "text": "Checking…" if req.get("cmd") == "check" else "Thinking…"})
     session = await _aquery_with_retry(docs, question, settings)
@@ -471,7 +701,11 @@ def main():
             send({"id": None, "type": "error", "message": "Malformed request."})
             continue
         try:
-            if req.get("cmd") in ("ask", "index", "check", "check_draft"):
+            if req.get("cmd") == "parse":
+                handle_parse(req)
+            elif req.get("cmd") == "audit":
+                asyncio.run(handle_audit(req))
+            elif req.get("cmd") in ("ask", "index", "check"):
                 asyncio.run(answer_real(req))
             else:
                 send({"id": req.get("id"), "type": "error",
