@@ -2344,7 +2344,7 @@ dependencies = [
 
 [[package]]
 name = "paperdock"
-version = "0.3.0"
+version = "1.0.0"
 dependencies = [
  "arboard",
  "dirs 5.0.1",
