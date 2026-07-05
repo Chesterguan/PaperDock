@@ -83,32 +83,17 @@ async fn check(
     spawn_worker(app, state, "check", library, collection_key, claim, String::new(), sk).await
 }
 
-/// Draft batch citation-check: extract claims from a pasted draft and judge each
-/// against the collection. Results arrive as a `draft` answer event.
+/// Pick a manuscript file (.docx / .tex) to audit; returns its absolute path
+/// (+ a sibling .bib for .tex if present). Parsing happens in `parse_manuscript`.
 #[tauri::command]
-async fn check_draft(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-    library: String,
-    collection_key: String,
-    draft: String,
-) -> Result<(), String> {
-    spawn_worker(app, state, "check_draft", library, collection_key, draft, String::new(), None).await
-}
-
-/// Pick a draft file (.txt/.md/.tex/.pdf) and return its text — for Check draft.
-#[tauri::command]
-async fn pick_draft_file(
-    app: tauri::AppHandle,
-    state: State<'_, AppState>,
-) -> Result<String, String> {
+async fn pick_manuscript(app: tauri::AppHandle) -> Result<Option<Manuscript>, String> {
     use tauri_plugin_dialog::DialogExt;
     let file = app
         .dialog()
         .file()
-        .add_filter("Draft", &["txt", "md", "markdown", "tex", "pdf"])
+        .add_filter("Manuscript", &["docx", "tex", "latex"])
         .blocking_pick_file();
-    let Some(file) = file else { return Ok(String::new()) };
+    let Some(file) = file else { return Ok(None) };
     let path = file
         .into_path()
         .map_err(|_| "Could not resolve the file path.".to_string())?;
@@ -117,21 +102,35 @@ async fn pick_draft_file(
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_lowercase();
-    if ext == "pdf" {
-        let py = sidecar::interpreter(&app, &state.worker_path);
-        let out = std::process::Command::new(py)
-            .arg("-c")
-            .arg("import sys,pypdf;r=pypdf.PdfReader(sys.argv[1]);print('\\n'.join((p.extract_text() or '') for p in r.pages))")
-            .arg(&path)
-            .output()
-            .map_err(|_| "Could not read the PDF.".to_string())?;
-        if !out.status.success() {
-            return Err("Could not extract text from that PDF.".to_string());
+    // For .tex, auto-pick a sibling .bib (same stem, else the first .bib in the dir).
+    let bib_path = if ext == "tex" || ext == "latex" {
+        let same_stem = path.with_extension("bib");
+        if same_stem.exists() {
+            Some(same_stem.to_string_lossy().into_owned())
+        } else {
+            path.parent().and_then(|dir| {
+                std::fs::read_dir(dir).ok().and_then(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .find(|p| p.extension().and_then(|x| x.to_str()) == Some("bib"))
+                        .map(|p| p.to_string_lossy().into_owned())
+                })
+            })
         }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
-        std::fs::read_to_string(&path).map_err(|_| "Could not read the file.".to_string())
-    }
+        None
+    };
+    Ok(Some(Manuscript {
+        path: path.to_string_lossy().into_owned(),
+        bib_path,
+    }))
+}
+
+/// A picked manuscript file + its resolved bibliography (for .tex).
+#[derive(serde::Serialize)]
+struct Manuscript {
+    path: String,
+    bib_path: Option<String>,
 }
 
 /// One checkable paper (has a PDF) in a collection — for the citation-check
@@ -290,6 +289,217 @@ async fn list_collection_papers(
             citation: d.citation,
         })
         .collect())
+}
+
+/// One claim + the specific paper it cites, ready to audit. Produced by
+/// `parse_manuscript`, edited in the UI, sent back to `run_audit`.
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct AuditClaim {
+    idx: usize,
+    claim: String,
+    /// Zotero item key of the cited paper (None = couldn't resolve → Tier-A only).
+    key: Option<String>,
+    /// Human citation string (for Tier A lookup + display).
+    citation: String,
+    /// Does the cited paper have a PDF we can verify against?
+    has_pdf: bool,
+}
+
+/// Parse a manuscript (.docx / .tex) into (claim, cited paper) rows, resolving
+/// each citation to a Zotero key + whether its PDF is available for Tier B.
+/// A claim citing N papers expands to N rows (each verified against one paper).
+#[tauri::command]
+async fn parse_manuscript(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    path: String,
+    #[allow(non_snake_case)] bib_path: Option<String>,
+    library: String,
+    collection_key: String,
+) -> Result<Vec<AuditClaim>, String> {
+    let rows =
+        sidecar::run_parse(&app, &state.worker_path, path, bib_path.unwrap_or_default()).await?;
+
+    let data_dir = {
+        state
+            .config
+            .lock()
+            .map_err(|_| "Config is unavailable.".to_string())?
+            .zotero_data_dir
+            .clone()
+    };
+    let resolved = zotero::collection_docs(&library, &collection_key, &data_dir).await?;
+    // Papers in this collection that HAVE a PDF: key -> citation.
+    let pdf_by_key: std::collections::HashMap<String, String> = resolved
+        .docs
+        .iter()
+        .map(|d| (d.zotero_key.clone(), d.citation.clone()))
+        .collect();
+
+    let mut out: Vec<AuditClaim> = Vec::new();
+    let mut idx = 0usize;
+    for row in &rows {
+        let claim = row
+            .get("claim")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if claim.is_empty() {
+            continue;
+        }
+        let str_vec = |field: &str| -> Vec<String> {
+            row.get(field)
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|s| s.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let keys = str_vec("keys");
+        let raws = str_vec("cites_raw");
+
+        // (key, citation) for each paper this claim cites.
+        let mut cited: Vec<(Option<String>, String)> = Vec::new();
+        if !keys.is_empty() {
+            // .docx — Zotero keys are exact.
+            for k in &keys {
+                let cite = pdf_by_key
+                    .get(k)
+                    .cloned()
+                    .or_else(|| raws.first().cloned())
+                    .unwrap_or_else(|| k.clone());
+                cited.push((Some(k.clone()), cite));
+            }
+        } else {
+            // .tex — match each cited title against the collection by word overlap.
+            for raw in &raws {
+                let best = resolved
+                    .docs
+                    .iter()
+                    .map(|d| (d, title_overlap(raw, &d.citation)))
+                    .max_by_key(|(_, o)| *o);
+                match best {
+                    Some((d, o)) if o >= 40 => {
+                        cited.push((Some(d.zotero_key.clone()), d.citation.clone()))
+                    }
+                    _ => cited.push((None, raw.clone())), // unresolved → Tier-A only
+                }
+            }
+        }
+
+        for (key, citation) in cited {
+            let has_pdf = key
+                .as_ref()
+                .map(|k| pdf_by_key.contains_key(k))
+                .unwrap_or(false);
+            out.push(AuditClaim {
+                idx,
+                claim: claim.clone(),
+                key,
+                citation,
+                has_pdf,
+            });
+            idx += 1;
+        }
+    }
+    Ok(out)
+}
+
+/// Audit the reviewed claims: verify each (with a PDF) against ONLY its cited
+/// paper. Streams `claim_result` answer events. Claims without a PDF are
+/// Tier-A-only and are not sent here.
+#[tauri::command]
+async fn run_audit(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    library: String,
+    collection_key: String,
+    claims: Vec<AuditClaim>,
+) -> Result<(), String> {
+    let (model, embedding, api_base, data_dir, api_key) = {
+        let cfg = state
+            .config
+            .lock()
+            .map_err(|_| "Config is unavailable.".to_string())?;
+        (
+            cfg.model.clone(),
+            cfg.embedding.clone(),
+            cfg.api_base.clone().unwrap_or_default(),
+            cfg.zotero_data_dir.clone(),
+            cfg.api_key.clone().unwrap_or_default(),
+        )
+    };
+
+    // Only claims with a resolvable PDF go to Tier B.
+    let cited_keys: std::collections::HashSet<String> = claims
+        .iter()
+        .filter(|c| c.has_pdf)
+        .filter_map(|c| c.key.clone())
+        .collect();
+    let claim_json: Vec<serde_json::Value> = claims
+        .iter()
+        .filter(|c| c.has_pdf)
+        .filter_map(|c| {
+            c.key
+                .as_ref()
+                .map(|k| serde_json::json!({"idx": c.idx, "claim": c.claim, "key": k}))
+        })
+        .collect();
+    if claim_json.is_empty() {
+        let _ = app.emit(
+            "answer",
+            AnswerEvent::Error {
+                message: "None of the cited papers have a PDF to verify against. Open them \
+                          in Zotero and download the PDFs, then try again."
+                    .to_string(),
+            },
+        );
+        return Ok(());
+    }
+
+    let resolved = zotero::collection_docs(&library, &collection_key, &data_dir).await?;
+    let docs: Vec<DocRef> = resolved
+        .docs
+        .into_iter()
+        .filter(|d| cited_keys.contains(&d.zotero_key))
+        .collect();
+
+    let n = REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let request_id = format!("a{n}");
+    let cache_dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("Could not resolve cache directory: {e}"))?
+        .join("paperqa_index")
+        .to_string_lossy()
+        .into_owned();
+
+    let worker_path = state.worker_path.clone();
+    let child_slot = state.child.clone();
+    let app_handle = app.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(message) = sidecar::run_audit(
+            app_handle.clone(),
+            worker_path,
+            request_id,
+            claim_json,
+            model,
+            embedding,
+            api_base,
+            cache_dir,
+            api_key,
+            docs,
+            child_slot,
+        )
+        .await
+        {
+            let _ = app_handle.emit("answer", AnswerEvent::Error { message });
+        }
+    });
+
+    Ok(())
 }
 
 /// Pre-embed a collection into the shared index (no LLM query), so later asks
@@ -909,6 +1119,25 @@ async fn export_lab_config(
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// Save an audit report (markdown) via a save dialog. Returns the saved path
+/// ("" if the user cancelled).
+#[tauri::command]
+async fn save_report(app: tauri::AppHandle, markdown: String) -> Result<String, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let file = app
+        .dialog()
+        .file()
+        .add_filter("Markdown report", &["md"])
+        .set_file_name("citation-audit.md")
+        .blocking_save_file();
+    let Some(file) = file else { return Ok(String::new()) };
+    let path = file
+        .into_path()
+        .map_err(|_| "Could not resolve the save path.".to_string())?;
+    std::fs::write(&path, markdown).map_err(|_| "Could not write the file.".to_string())?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
 /// Import a `.paperdock` file chosen via an open dialog. Returns the lab name.
 #[tauri::command]
 async fn import_lab_config(
@@ -968,8 +1197,9 @@ pub fn run() {
             list_collections,
             ask,
             check,
-            check_draft,
-            pick_draft_file,
+            pick_manuscript,
+            parse_manuscript,
+            run_audit,
             list_collection_papers,
             verify_reference,
             copy_html,
@@ -989,6 +1219,7 @@ pub fn run() {
             set_settings,
             export_lab_config,
             import_lab_config,
+            save_report,
         ])
         .build(tauri::generate_context!())
         .expect("error while building PaperDock")

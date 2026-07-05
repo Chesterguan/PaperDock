@@ -16,17 +16,16 @@ pub enum AnswerEvent {
     References { items: Vec<RefItem> },
     /// A non-fatal heads-up (e.g. some papers had no PDF and were skipped).
     Notice { message: String },
-    /// Draft batch citation-check: per-claim verdicts.
-    Draft { claims: Vec<DraftItem> },
+    /// Manuscript audit: one verified claim (streamed as each finishes).
+    #[serde(rename = "claim_result")]
+    ClaimResult {
+        idx: usize,
+        verdict: String,
+        detail: String,
+        passages: Vec<Passage>,
+    },
     Done,
     Error { message: String },
-}
-
-#[derive(Clone, serde::Serialize)]
-pub struct DraftItem {
-    pub claim: String,
-    pub verdict: String,
-    pub detail: String,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -98,6 +97,126 @@ pub async fn run_ask(
         "docs": docs_json,
     });
 
+    run_worker(app, worker_path, request, child_slot).await
+}
+
+/// Manuscript audit: send the reviewed `claims` + cited `docs`, stream one
+/// `claim_result` event per claim as it finishes.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_audit(
+    app: tauri::AppHandle,
+    worker_path: String,
+    request_id: String,
+    claims: Vec<Value>,
+    model: String,
+    embedding: String,
+    api_base: String,
+    cache_dir: String,
+    api_key: String,
+    docs: Vec<crate::zotero::DocRef>,
+    child_slot: ChildSlot,
+) -> Result<(), String> {
+    let docs_json: Vec<Value> = docs
+        .iter()
+        .map(|d| {
+            json!({
+                "path": d.path,
+                "zotero_key": d.zotero_key,
+                "citation": d.citation,
+            })
+        })
+        .collect();
+    let request = json!({
+        "id": request_id,
+        "cmd": "audit",
+        "claims": claims,
+        "docs": docs_json,
+        "cache_dir": cache_dir,
+        "model": model,
+        "embedding": embedding,
+        "api_base": api_base,
+        "api_key": api_key,
+    });
+    run_worker(app, worker_path, request, child_slot).await
+}
+
+/// One-shot: run the worker's `parse` command and return the parsed claim rows
+/// (raw JSON objects). Fast, no LLM — not cancelable.
+pub async fn run_parse(
+    app: &tauri::AppHandle,
+    worker_path: &str,
+    path: String,
+    bib_path: String,
+) -> Result<Vec<Value>, String> {
+    let request = json!({"id": "parse", "cmd": "parse", "path": path, "bib_path": bib_path});
+    let mut line = serde_json::to_string(&request)
+        .map_err(|_| "Could not build the parse request.".to_string())?;
+    line.push('\n');
+    let mut child = Command::new(python_for_worker(app, worker_path))
+        .arg(worker_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| "Could not start the parser.".to_string())?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Could not connect to the parser.".to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Could not read from the parser.".to_string())?;
+    stdin
+        .write_all(line.as_bytes())
+        .await
+        .map_err(|_| "Could not send the file to the parser.".to_string())?;
+    let _ = stdin.shutdown().await;
+    drop(stdin);
+    let mut reader = BufReader::new(stdout).lines();
+    let mut result: Option<Result<Vec<Value>, String>> = None;
+    while let Ok(Some(raw)) = reader.next_line().await {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(raw) else {
+            continue;
+        };
+        match v.get("type").and_then(Value::as_str) {
+            Some("claims") => {
+                let items = v
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                result = Some(Ok(items));
+            }
+            Some("error") => {
+                result = Some(Err(v
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Could not parse the file.")
+                    .to_string()));
+                break;
+            }
+            Some("done") => break,
+            _ => {}
+        }
+    }
+    let _ = child.wait().await;
+    result.unwrap_or_else(|| Err("The parser found no cited claims.".to_string()))
+}
+
+/// Spawn the worker, send one request line, stream its JSON-line output back as
+/// `answer` events. Shared by ask/check/index and audit.
+async fn run_worker(
+    app: tauri::AppHandle,
+    worker_path: String,
+    request: Value,
+    child_slot: ChildSlot,
+) -> Result<(), String> {
     let mut line = match serde_json::to_string(&request) {
         Ok(s) => s,
         Err(_) => {
@@ -228,12 +347,6 @@ async fn clear_slot(child_slot: &ChildSlot) {
 /// `python3` only if none is provisioned.
 fn python_for_worker(app: &tauri::AppHandle, worker_path: &str) -> String {
     resolve_python(app, worker_path).unwrap_or_else(|| "python3".to_string())
-}
-
-/// The provisioned Python interpreter (for one-off tasks like PDF text
-/// extraction). Same resolution as the worker uses.
-pub fn interpreter(app: &tauri::AppHandle, worker_path: &str) -> String {
-    python_for_worker(app, worker_path)
 }
 
 // ---- First-run Python environment provisioning -------------------------
@@ -435,6 +548,28 @@ fn cache_dir_index_name(cache_dir: &str) -> String {
         .to_string()
 }
 
+/// Parse a `passages` JSON array (page + snippet) into `Vec<Passage>`.
+fn parse_passages(v: Option<&Value>) -> Vec<Passage> {
+    v.and_then(Value::as_array)
+        .map(|ps| {
+            ps.iter()
+                .map(|p| Passage {
+                    page: p
+                        .get("page")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    snippet: p
+                        .get("snippet")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Translate one worker JSON line into an AnswerEvent. Unknown types are
 /// ignored (returns None).
 fn parse_event(raw: &str) -> Option<AnswerEvent> {
@@ -498,34 +633,20 @@ fn parse_event(raw: &str) -> Option<AnswerEvent> {
                 .unwrap_or_default();
             Some(AnswerEvent::References { items })
         }
-        "draft" => {
-            let items = v
-                .get("items")
-                .and_then(Value::as_array)
-                .map(|arr| {
-                    arr.iter()
-                        .map(|it| DraftItem {
-                            claim: it
-                                .get("claim")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            verdict: it
-                                .get("verdict")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                            detail: it
-                                .get("detail")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_string(),
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            Some(AnswerEvent::Draft { claims: items })
-        }
+        "claim_result" => Some(AnswerEvent::ClaimResult {
+            idx: v.get("idx").and_then(Value::as_u64).unwrap_or(0) as usize,
+            verdict: v
+                .get("verdict")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            detail: v
+                .get("detail")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            passages: parse_passages(v.get("passages")),
+        }),
         "done" => Some(AnswerEvent::Done),
         "error" => Some(AnswerEvent::Error {
             message: v
