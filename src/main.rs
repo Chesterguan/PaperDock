@@ -5,6 +5,8 @@
 //! backend via `window.__TAURI__` (withGlobalTauri). See the frozen Rust
 //! module contract in the project spec.
 
+use std::collections::{HashMap, HashSet};
+
 use leptos::prelude::*;
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
@@ -143,12 +145,32 @@ fn parse_frac(s: &str) -> Option<f64> {
     (b > 0.0).then(|| (a / b).clamp(0.0, 1.0))
 }
 
+/// One parsed claim + the specific paper it cites (from `parse_manuscript`).
+/// Editable in the review step before the audit runs.
 #[derive(Clone, Deserialize)]
-struct DraftItem {
+struct AuditClaim {
+    idx: usize,
     claim: String,
-    verdict: String,
     #[serde(default)]
+    key: Option<String>,
+    citation: String,
+    has_pdf: bool,
+}
+
+/// A picked manuscript file + its resolved bibliography (for .tex).
+#[derive(Clone, Deserialize)]
+struct Manuscript {
+    path: String,
+    #[serde(default)]
+    bib_path: Option<String>,
+}
+
+/// The audit verdict for one claim (streamed back as `claim_result`).
+#[derive(Clone, Default)]
+struct ClaimResult {
+    verdict: String,
     detail: String,
+    passages: Vec<Passage>,
 }
 
 /// One completed Q&A in the conversation thread.
@@ -168,8 +190,15 @@ struct AnswerEvent {
     text: Option<String>,
     #[serde(default)]
     items: Option<Vec<RefItem>>,
+    // Manuscript-audit per-claim result.
     #[serde(default)]
-    claims: Option<Vec<DraftItem>>,
+    idx: Option<usize>,
+    #[serde(default)]
+    verdict: Option<String>,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    passages: Option<Vec<Passage>>,
     #[serde(default)]
     message: Option<String>,
 }
@@ -207,10 +236,18 @@ fn App() -> impl IntoView {
     let ref_input = RwSignal::new(String::new());
     let ref_result = RwSignal::new(Option::<RefMatchWire>::None);
     let verifying = RwSignal::new(false);
-    // Draft batch citation-check.
-    let draft_input = RwSignal::new(String::new());
-    let draft_items = RwSignal::new(Vec::<DraftItem>::new());
-    let draft_running = RwSignal::new(false);
+    // Manuscript audit.
+    let audit_claims = RwSignal::new(Vec::<AuditClaim>::new()); // parsed + editable
+    let audit_results = RwSignal::new(HashMap::<usize, ClaimResult>::new()); // idx → verdict
+    let audit_running = RwSignal::new(false);
+    let audit_total = RwSignal::new(0usize); // claims sent to Tier B
+    let audit_done = RwSignal::new(0usize); // claim_results received
+    let audit_tier_a = RwSignal::new(HashMap::<String, RefMatchWire>::new()); // citation → CrossRef
+    let audit_flags = RwSignal::new(HashSet::<usize>::new()); // user-flagged claim idxs
+    let audit_msg = RwSignal::new(String::new()); // import/parse status line
+    // For adding a missed claim: text + which paper it cites.
+    let new_claim = RwSignal::new(String::new());
+    let new_claim_key = RwSignal::new(String::new());
     // Conversation thread: `asked` is the current in-progress question; `history`
     // holds completed turns above it.
     let asked = RwSignal::new(String::new());
@@ -280,19 +317,31 @@ fn App() -> impl IntoView {
                         notice.set(t);
                     }
                 }
-                "draft" => {
-                    if let Some(items) = e.claims {
-                        draft_items.set(items);
+                "claim_result" => {
+                    if let Some(i) = e.idx {
+                        let r = ClaimResult {
+                            verdict: e.verdict.unwrap_or_default(),
+                            detail: e.detail.unwrap_or_default(),
+                            passages: e.passages.unwrap_or_default(),
+                        };
+                        audit_results.update(|m| {
+                            m.insert(i, r);
+                        });
+                        audit_done.update(|n| *n += 1);
                     }
                 }
                 "done" => {
                     streaming.set(false);
-                    draft_running.set(false);
-                    status.set("Indexed ✓".to_string());
+                    audit_running.set(false);
+                    if mode.get_untracked() == "audit" {
+                        status.set("Audit complete ✓".to_string());
+                    } else {
+                        status.set("Indexed ✓".to_string());
+                    }
                 }
                 "error" => {
                     streaming.set(false);
-                    draft_running.set(false);
+                    audit_running.set(false);
                     let msg = e.message.unwrap_or_else(|| "Something went wrong.".into());
                     status.set(msg);
                 }
@@ -531,9 +580,11 @@ fn App() -> impl IntoView {
         index();
     };
 
-    // In Check mode, load the collection's papers so the user can target one.
+    // In Check/Audit mode, load the collection's papers so the user can target
+    // one (Check) or attach a missed claim to a paper (Audit).
     Effect::new(move |_| {
-        if mode.get() != "check" {
+        let m = mode.get();
+        if m != "check" && m != "audit" {
             return;
         }
         let id = selected.get();
@@ -789,41 +840,197 @@ fn App() -> impl IntoView {
         send_rating(fb_pending.get_untracked(), allow);
     };
 
-    let submit_draft = move || {
-        let d = draft_input.get();
+    // Import a .docx / .tex → parse into (claim, cited paper) rows for review.
+    let import_manuscript = move || {
         let id = selected.get();
-        if d.trim().is_empty() || id.is_empty() || draft_running.get() {
+        if id.is_empty() {
+            audit_msg.set("Pick a Zotero collection first (top of the window).".into());
             return;
         }
         let (library, key) = id.split_once("::").unwrap_or(("users/0", id.as_str()));
         let (library, key) = (library.to_string(), key.to_string());
-        draft_items.set(Vec::new());
-        draft_running.set(true);
-        status.set("Indexing…".to_string());
+        audit_msg.set("Reading the manuscript…".into());
+        audit_claims.set(Vec::new());
+        audit_results.set(HashMap::new());
+        audit_tier_a.set(HashMap::new());
+        audit_flags.set(HashSet::new());
+        spawn_local(async move {
+            let picked = invoke("pick_manuscript", args(serde_json::json!({}))).await;
+            let Ok(picked) = picked else {
+                audit_msg.set("Could not open the file picker.".into());
+                return;
+            };
+            let Ok(Some(m)) = serde_wasm_bindgen::from_value::<Option<Manuscript>>(picked) else {
+                audit_msg.set(String::new()); // cancelled
+                return;
+            };
+            match invoke(
+                "parse_manuscript",
+                args(serde_json::json!({
+                    "path": m.path, "bibPath": m.bib_path,
+                    "library": library, "collectionKey": key,
+                })),
+            )
+            .await
+            {
+                Ok(v) => match serde_wasm_bindgen::from_value::<Vec<AuditClaim>>(v) {
+                    Ok(list) if !list.is_empty() => {
+                        let n = list.len();
+                        audit_claims.set(list);
+                        audit_msg.set(format!(
+                            "Found {n} cited claim{}. Review below, then run the audit.",
+                            if n == 1 { "" } else { "s" }
+                        ));
+                    }
+                    _ => audit_msg.set("No cited claims found in that file.".into()),
+                },
+                Err(e) => {
+                    let msg = serde_wasm_bindgen::from_value::<String>(e)
+                        .unwrap_or_else(|_| "Could not parse the manuscript.".into());
+                    audit_msg.set(msg);
+                }
+            }
+        });
+    };
+
+    // Remove one claim from the review list.
+    let remove_claim = move |idx: usize| {
+        audit_claims.update(|v| v.retain(|c| c.idx != idx));
+    };
+
+    // Add a claim the parser missed, attached to a chosen paper.
+    let add_claim = move || {
+        let text = new_claim.get();
+        let k = new_claim_key.get();
+        if text.trim().is_empty() || k.is_empty() {
+            return;
+        }
+        let citation = papers
+            .get_untracked()
+            .into_iter()
+            .find(|p| p.key == k)
+            .map(|p| p.citation)
+            .unwrap_or_else(|| k.clone());
+        audit_claims.update(|v| {
+            let idx = v.iter().map(|c| c.idx).max().map(|m| m + 1).unwrap_or(0);
+            v.push(AuditClaim {
+                idx,
+                claim: text.trim().to_string(),
+                key: Some(k),
+                citation,
+                has_pdf: true, // the paper picker only lists PDF-bearing papers
+            });
+        });
+        new_claim.set(String::new());
+        new_claim_key.set(String::new());
+    };
+
+    // Run the audit over the (reviewed) claims: Tier B for PDF-backed claims,
+    // Tier A (CrossRef) for every distinct cited paper.
+    let run_audit_now = move || {
+        let id = selected.get();
+        let claims = audit_claims.get();
+        if id.is_empty() || claims.is_empty() || audit_running.get() {
+            return;
+        }
+        let (library, key) = id.split_once("::").unwrap_or(("users/0", id.as_str()));
+        let (library, key) = (library.to_string(), key.to_string());
+        let n_pdf = claims.iter().filter(|c| c.has_pdf).count();
+        audit_results.set(HashMap::new());
+        audit_done.set(0);
+        audit_total.set(n_pdf);
+        audit_running.set(true);
+        status.set("Indexing cited papers…".into());
+
+        // Tier A: verify each distinct citation string against CrossRef.
+        let mut seen = HashSet::new();
+        for c in &claims {
+            if seen.insert(c.citation.clone()) {
+                let citation = c.citation.clone();
+                spawn_local(async move {
+                    if let Ok(v) = invoke(
+                        "verify_reference",
+                        args(serde_json::json!({ "reference": citation.clone() })),
+                    )
+                    .await
+                    {
+                        if let Ok(r) = serde_wasm_bindgen::from_value::<RefMatchWire>(v) {
+                            audit_tier_a.update(|m| {
+                                m.insert(citation, r);
+                            });
+                        }
+                    }
+                });
+            }
+        }
+
+        // Tier B: verify each PDF-backed claim against only its cited paper.
+        let claims_json: Vec<serde_json::Value> = claims
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "idx": c.idx, "claim": c.claim, "key": c.key,
+                    "citation": c.citation, "has_pdf": c.has_pdf,
+                })
+            })
+            .collect();
         spawn_local(async move {
             let res = invoke(
-                "check_draft",
+                "run_audit",
                 args(serde_json::json!({
-                    "library": library, "collectionKey": key, "draft": d,
+                    "library": library, "collectionKey": key, "claims": claims_json,
                 })),
             )
             .await;
             if let Err(e) = res {
-                draft_running.set(false);
+                audit_running.set(false);
                 let msg = serde_wasm_bindgen::from_value::<String>(e)
-                    .unwrap_or_else(|_| "Could not start the draft check.".into());
+                    .unwrap_or_else(|_| "Could not start the audit.".into());
                 status.set(msg);
             }
         });
     };
 
-    // Upload a draft file (.txt/.md/.tex/.pdf) → its text fills the draft box.
-    let pick_draft = move || {
+    // Export the audit as a Markdown report (saved via a file dialog).
+    let export_report = move || {
+        let claims = audit_claims.get_untracked();
+        if claims.is_empty() {
+            return;
+        }
+        let results = audit_results.get_untracked();
+        let tier_a = audit_tier_a.get_untracked();
+        let flags = audit_flags.get_untracked();
+        let mut md = String::from("# Citation audit\n\n");
+        for c in &claims {
+            let flag = if flags.contains(&c.idx) { " 🚩" } else { "" };
+            md.push_str(&format!("## Claim{flag}\n\n> {}\n\n", c.claim));
+            md.push_str(&format!("**Cited:** {}\n\n", c.citation));
+            match tier_a.get(&c.citation) {
+                Some(r) if r.found => md.push_str(&format!(
+                    "**Reference check:** real paper ({}% match) — {} ({}) DOI {}\n\n",
+                    r.confidence, r.authors, r.year, r.doi
+                )),
+                Some(_) => md.push_str("**Reference check:** no CrossRef match — may be fabricated.\n\n"),
+                None => {}
+            }
+            if !c.has_pdf {
+                md.push_str("**Support:** no PDF — claim support not verified.\n\n");
+            } else if let Some(r) = results.get(&c.idx) {
+                md.push_str(&format!("**Support:** {}\n\n{}\n\n", r.verdict, r.detail));
+                for p in &r.passages {
+                    let pg = if p.page.is_empty() { String::new() } else { format!(" (p. {})", p.page) };
+                    md.push_str(&format!("> {}{}\n\n", p.snippet, pg));
+                }
+            } else {
+                md.push_str("**Support:** (not checked)\n\n");
+            }
+            md.push_str("---\n\n");
+        }
         spawn_local(async move {
-            if let Ok(v) = invoke("pick_draft_file", args(serde_json::json!({}))).await {
-                if let Ok(text) = serde_wasm_bindgen::from_value::<String>(v) {
-                    if !text.trim().is_empty() {
-                        draft_input.set(text);
+            if let Ok(v) = invoke("save_report", args(serde_json::json!({ "markdown": md }))).await {
+                if let Ok(path) = serde_wasm_bindgen::from_value::<String>(v) {
+                    if !path.is_empty() {
+                        toast.set("Report saved ✓".into());
                     }
                 }
             }
@@ -1110,10 +1317,10 @@ fn App() -> impl IntoView {
                     on:click=move |_| mode.set("verify".into())
                     title="Paste a reference — check it's a real paper via CrossRef (catches fabricated citations)."
                 >"Verify reference"</button>
-                <button class="mode" class:on=move || mode.get() == "draft"
-                    on:click=move |_| mode.set("draft".into())
-                    title="Paste or upload a draft — PaperDock extracts every claim and batch-checks each against your papers."
-                >"Check draft"</button>
+                <button class="mode" class:on=move || mode.get() == "audit"
+                    on:click=move |_| mode.set("audit".into())
+                    title="Import a .docx / .tex manuscript — PaperDock verifies each claim against the specific paper it cites."
+                >"Audit manuscript"</button>
                 {move || (!answer.get().is_empty() || !history.get().is_empty()).then(|| view! {
                     <button class="newchat"
                         title="Start a fresh conversation — clears the current thread. Do this when you switch to a new topic, so a saved note stays one coherent conversation."
@@ -1199,70 +1406,110 @@ fn App() -> impl IntoView {
                 }}
             })}
 
-            // Check-draft: textarea + batch results.
-            {move || (mode.get() == "draft").then(|| view! {
-                <div class="draftbox">
-                    <button class="draft-upload" title="Upload a .txt / .md / .tex / .pdf draft"
-                        prop:disabled=move || draft_running.get()
-                        on:click=move |_| pick_draft()>"📎 Upload a draft file"</button>
-                    <textarea class="draft-input"
-                        placeholder="…or paste a draft / paragraph — PaperDock extracts its claims and checks each against these papers."
-                        prop:value=move || draft_input.get()
-                        prop:disabled=move || draft_running.get()
-                        on:input=move |ev| draft_input.set(event_target_value(&ev))></textarea>
-                    <button class="draft-go" prop:disabled=move || draft_running.get()
-                        on:click=move |_| submit_draft()>
-                        {move || if draft_running.get() { "Checking…".to_string() } else { "Check draft".to_string() }}
-                    </button>
+            // Manuscript audit: import → review claims → run → per-claim results.
+            {move || (mode.get() == "audit").then(|| view! {
+                <div class="auditbar">
+                    <button class="draft-upload" title="Import a .docx (Zotero citations) or .tex + .bib manuscript"
+                        prop:disabled=move || audit_running.get()
+                        on:click=move |_| import_manuscript()>"📄 Import manuscript (.docx / .tex)"</button>
+                    {move || (!audit_claims.get().is_empty()).then(|| view! {
+                        <button class="draft-go" prop:disabled=move || audit_running.get()
+                            on:click=move |_| run_audit_now()>
+                            {move || if audit_running.get() {
+                                format!("Checking {}/{}…", audit_done.get(), audit_total.get())
+                            } else { "Run audit".to_string() }}
+                        </button>
+                        <button class="mode" title="Save the audit as a Markdown report"
+                            on:click=move |_| export_report()>"⬇ Export"</button>
+                    })}
                 </div>
-                {move || {
-                    let items = draft_items.get();
-                    if items.is_empty() {
-                        return ().into_any();
-                    }
-                    let count = |v: &str| items.iter().filter(|i| i.verdict == v).count();
-                    let (sup, par, no, ins) = (
-                        count("SUPPORTED"), count("PARTIALLY SUPPORTED"),
-                        count("NOT SUPPORTED"), count("INSUFFICIENT EVIDENCE"),
-                    );
-                    let total = items.len().max(1);
-                    let w = |n: usize| format!("width:{}%", n * 100 / total);
-                    view! {
-                        <div class="draft-summary">
-                            <div class="bar">
-                                <span class="seg ok" style=w(sup)></span>
-                                <span class="seg par" style=w(par)></span>
-                                <span class="seg no" style=w(no)></span>
-                                <span class="seg ins" style=w(ins)></span>
-                            </div>
-                            <div class="legend">
-                                <span class="ok">{format!("{sup} supported")}</span>
-                                <span class="par">{format!("{par} partial")}</span>
-                                <span class="no">{format!("{no} unsupported")}</span>
-                                <span class="ins">{format!("{ins} insufficient")}</span>
-                            </div>
-                        </div>
-                        <div class="draft-list">
-                            {items.into_iter().map(|it| {
-                                let cls = match it.verdict.as_str() {
-                                    "SUPPORTED" => "dv ok",
-                                    "PARTIALLY SUPPORTED" => "dv par",
-                                    "NOT SUPPORTED" => "dv no",
-                                    _ => "dv ins",
-                                };
-                                view! {
-                                    <div class="draft-item">
-                                        <span class=cls>{it.verdict}</span>
-                                        <div class="di-body">
-                                            <div class="di-claim">{it.claim}</div>
-                                            <div class="di-detail">{it.detail}</div>
-                                        </div>
-                                    </div>
-                                }
+                {move || (!audit_msg.get().is_empty())
+                    .then(|| view! { <div class="notice">{audit_msg.get()}</div> })}
+
+                // Add-a-missed-claim row.
+                {move || (!audit_claims.get().is_empty()).then(|| view! {
+                    <div class="audit-add">
+                        <input class="ask" type="text" placeholder="Add a claim the parser missed…"
+                            prop:value=move || new_claim.get()
+                            on:input=move |ev| new_claim.set(event_target_value(&ev)) />
+                        <select class="source-select"
+                            on:change=move |ev| new_claim_key.set(event_target_value(&ev))>
+                            <option value="">"Cites which paper?"</option>
+                            {move || papers.get().into_iter().map(|p| view! {
+                                <option value=p.key>{p.citation}</option>
                             }).collect::<Vec<_>>()}
-                        </div>
-                    }.into_any()
-                }}
+                        </select>
+                        <button class="mode" on:click=move |_| add_claim()>"＋ Add"</button>
+                    </div>
+                })}
+
+                // Claim rows: text + cited paper + Tier A + Tier B verdict + flag.
+                <div class="audit-list">
+                    {move || {
+                        let results = audit_results.get();
+                        let tier_a = audit_tier_a.get();
+                        let flags = audit_flags.get();
+                        audit_claims.get().into_iter().map(|c| {
+                            let idx = c.idx;
+                            let flagged = flags.contains(&idx);
+                            // Tier B verdict cell.
+                            let (vcls, vlabel, detail, passages) = if !c.has_pdf {
+                                ("av nopdf", "No PDF".to_string(), String::new(), Vec::new())
+                            } else if let Some(r) = results.get(&idx) {
+                                let cls = match r.verdict.as_str() {
+                                    "SUPPORTED" => "av ok",
+                                    "PARTIALLY SUPPORTED" => "av par",
+                                    "NOT SUPPORTED" => "av no",
+                                    _ => "av ins",
+                                };
+                                (cls, r.verdict.clone(), r.detail.clone(), r.passages.clone())
+                            } else if audit_running.get() {
+                                ("av wait", "…".to_string(), String::new(), Vec::new())
+                            } else {
+                                ("av idle", "—".to_string(), String::new(), Vec::new())
+                            };
+                            // Tier A badge.
+                            let tier_a_badge = match tier_a.get(&c.citation) {
+                                Some(r) if r.found && r.confidence >= 55 =>
+                                    view! { <span class="ta ok" title="Real paper (CrossRef)">"ref ✓"</span> }.into_any(),
+                                Some(r) if r.found =>
+                                    view! { <span class="ta warn" title="Weak CrossRef match">{format!("ref ? {}%", r.confidence)}</span> }.into_any(),
+                                Some(_) =>
+                                    view! { <span class="ta bad" title="No CrossRef match — may be fabricated">"ref ✗"</span> }.into_any(),
+                                None => view! { <span></span> }.into_any(),
+                            };
+                            view! {
+                                <div class="audit-item">
+                                    <div class="ai-head">
+                                        <span class=vcls>{vlabel}</span>
+                                        {tier_a_badge}
+                                        <button class="ai-flag" class:on=flagged
+                                            title="Flag this verdict as wrong / to revisit"
+                                            on:click=move |_| audit_flags.update(|s| {
+                                                if !s.insert(idx) { s.remove(&idx); }
+                                            })>"🚩"</button>
+                                        <button class="ai-del" title="Remove this claim"
+                                            on:click=move |_| remove_claim(idx)>"✕"</button>
+                                    </div>
+                                    <div class="ai-claim">{c.claim.clone()}</div>
+                                    <div class="ai-cite">{c.citation.clone()}</div>
+                                    {(!c.has_pdf).then(|| view! {
+                                        <div class="ai-nopdf">"No PDF in Zotero — reference-checked only, claim support not verified."</div>
+                                    })}
+                                    {(!detail.is_empty()).then(|| view! { <div class="ai-detail">{detail.clone()}</div> })}
+                                    {(!passages.is_empty()).then(|| view! {
+                                        <div class="ai-passages">
+                                            {passages.into_iter().map(|p| {
+                                                let pg = if p.page.is_empty() { String::new() } else { format!(" (p. {})", p.page) };
+                                                view! { <div class="ai-passage">{format!("“{}”{}", p.snippet, pg)}</div> }
+                                            }).collect::<Vec<_>>()}
+                                        </div>
+                                    })}
+                                </div>
+                            }
+                        }).collect::<Vec<_>>()
+                    }}
+                </div>
             })}
 
             // Current question (shown above its streaming answer).

@@ -806,6 +806,34 @@ input.ask:disabled {
 .draft-upload:hover { background: var(--accent-dim); border-color: var(--accent); }
 .draft-upload:disabled { opacity: .5; cursor: default; }
 
+/* ---- manuscript audit ---- */
+.auditbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.audit-add { display: flex; gap: 8px; margin: 12px 0 4px; align-items: center; }
+.audit-add .ask { flex: 1 1 auto; }
+.audit-list { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
+.audit-item { padding: 12px 14px; background: var(--bg-raised); border: 1px solid var(--border); border-radius: 8px; }
+.ai-head { display: flex; align-items: center; gap: 8px; }
+.av { font-family: var(--mono); font-size: 10px; padding: 3px 8px; border-radius: 5px; white-space: nowrap; }
+.av.ok { color: var(--accent); background: var(--accent-dim); }
+.av.par { color: #d8b07a; background: rgba(216,176,122,.12); }
+.av.no { color: #d98b7a; background: rgba(217,139,122,.12); }
+.av.ins, .av.nopdf, .av.idle { color: var(--text-faint); background: rgba(97,102,108,.12); }
+.av.wait { color: var(--text-dim); background: rgba(97,102,108,.12); }
+.ta { font-family: var(--mono); font-size: 10px; padding: 3px 7px; border-radius: 5px; }
+.ta.ok { color: var(--accent); background: var(--accent-dim); }
+.ta.warn { color: #d8b07a; background: rgba(216,176,122,.12); }
+.ta.bad { color: #d98b7a; background: rgba(217,139,122,.12); }
+.ai-flag, .ai-del { margin-left: auto; background: transparent; border: none; cursor: pointer; font-size: 12px; opacity: .5; transition: opacity var(--t); }
+.ai-del { margin-left: 0; }
+.ai-flag:hover, .ai-del:hover { opacity: 1; }
+.ai-flag.on { opacity: 1; }
+.ai-claim { margin-top: 8px; font-size: 13.5px; color: var(--text); line-height: 1.5; }
+.ai-cite { margin-top: 4px; font-family: var(--mono); font-size: 11px; color: var(--text-dim); }
+.ai-nopdf { margin-top: 6px; font-size: 12px; color: #d8b07a; }
+.ai-detail { margin-top: 6px; font-size: 12px; color: var(--text-dim); line-height: 1.5; }
+.ai-passages { margin-top: 6px; display: flex; flex-direction: column; gap: 5px; }
+.ai-passage { font-size: 12px; color: var(--text-dim); border-left: 2px solid var(--border-focus); padding-left: 10px; line-height: 1.5; }
+
 .toast-link { margin-left: 12px; color: var(--accent); text-decoration: underline; text-underline-offset: 2px; cursor: pointer; font-weight: 500; }
 
 .newchat { margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--text-dim); background: transparent; border: 1px solid var(--border); border-radius: 6px; padding: 4px 12px; cursor: pointer; transition: color var(--t), border-color var(--t); }
