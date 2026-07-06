@@ -30,6 +30,33 @@ fn args(v: serde_json::Value) -> JsValue {
     serde_wasm_bindgen::to_value(&v).unwrap_or(JsValue::NULL)
 }
 
+/// A small stroke icon (24×24, currentColor). Replaces emoji throughout the UI.
+fn icon(name: &str) -> leptos::prelude::AnyView {
+    let paths: &[&str] = match name {
+        "file" => &["M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z", "M14 2v6h6"],
+        "download" => &["M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4", "M7 10l5 5 5-5", "M12 15V3"],
+        "flag" => &["M4 15s1-1 4-1 5 2 8 2 4-1 4-1V3s-1 1-4 1-5-2-8-2-4 1-4 1z", "M4 22v-7"],
+        "x" => &["M18 6 6 18", "M6 6l12 12"],
+        "check" => &["M20 6 9 17l-5-5"],
+        "minus" => &["M5 12h14"],
+        "alert" => &["M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z", "M12 9v4", "M12 17h.01"],
+        "gear" => &["M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z", "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"],
+        "thumbup" => &["M7 10v12", "M15 5.88 14 10h5.83a2 2 0 0 1 1.92 2.56l-2.33 8A2 2 0 0 1 17.5 22H4a2 2 0 0 1-2-2v-8a2 2 0 0 1 2-2h2.76a2 2 0 0 0 1.79-1.11L12 2a3.13 3.13 0 0 1 3 3.88z"],
+        "thumbdown" => &["M17 14V2", "M9 18.12 10 14H4.17a2 2 0 0 1-1.92-2.56l2.33-8A2 2 0 0 1 6.5 2H20a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2h-2.76a2 2 0 0 0-1.79 1.11L12 22a3.13 3.13 0 0 1-3-3.88z"],
+        _ => &[""],
+    };
+    let ps: Vec<_> = paths
+        .iter()
+        .map(|d| view! { <path d=*d></path> })
+        .collect();
+    view! {
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+            stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"
+            aria-hidden="true">{ps}</svg>
+    }
+    .into_any()
+}
+
 /// Build a click handler that opens an external URL in the default browser.
 fn open_link(url: &'static str) -> impl Fn(web_sys::MouseEvent) + Clone {
     move |ev: web_sys::MouseEvent| {
@@ -245,9 +272,6 @@ fn App() -> impl IntoView {
     let audit_tier_a = RwSignal::new(HashMap::<String, RefMatchWire>::new()); // citation → CrossRef
     let audit_flags = RwSignal::new(HashSet::<usize>::new()); // user-flagged claim idxs
     let audit_msg = RwSignal::new(String::new()); // import/parse status line
-    // For adding a missed claim: text + which paper it cites.
-    let new_claim = RwSignal::new(String::new());
-    let new_claim_key = RwSignal::new(String::new());
     // Conversation thread: `asked` is the current in-progress question; `history`
     // holds completed turns above it.
     let asked = RwSignal::new(String::new());
@@ -580,11 +604,9 @@ fn App() -> impl IntoView {
         index();
     };
 
-    // In Check/Audit mode, load the collection's papers so the user can target
-    // one (Check) or attach a missed claim to a paper (Audit).
+    // In Check mode, load the collection's papers so the user can target one.
     Effect::new(move |_| {
-        let m = mode.get();
-        if m != "check" && m != "audit" {
+        if mode.get() != "check" {
             return;
         }
         let id = selected.get();
@@ -898,33 +920,6 @@ fn App() -> impl IntoView {
         audit_claims.update(|v| v.retain(|c| c.idx != idx));
     };
 
-    // Add a claim the parser missed, attached to a chosen paper.
-    let add_claim = move || {
-        let text = new_claim.get();
-        let k = new_claim_key.get();
-        if text.trim().is_empty() || k.is_empty() {
-            return;
-        }
-        let citation = papers
-            .get_untracked()
-            .into_iter()
-            .find(|p| p.key == k)
-            .map(|p| p.citation)
-            .unwrap_or_else(|| k.clone());
-        audit_claims.update(|v| {
-            let idx = v.iter().map(|c| c.idx).max().map(|m| m + 1).unwrap_or(0);
-            v.push(AuditClaim {
-                idx,
-                claim: text.trim().to_string(),
-                key: Some(k),
-                citation,
-                has_pdf: true, // the paper picker only lists PDF-bearing papers
-            });
-        });
-        new_claim.set(String::new());
-        new_claim_key.set(String::new());
-    };
-
     // Run the audit over the (reviewed) claims: Tier B for PDF-backed claims,
     // Tier A (CrossRef) for every distinct cited paper.
     let run_audit_now = move || {
@@ -1002,7 +997,7 @@ fn App() -> impl IntoView {
         let flags = audit_flags.get_untracked();
         let mut md = String::from("# Citation audit\n\n");
         for c in &claims {
-            let flag = if flags.contains(&c.idx) { " 🚩" } else { "" };
+            let flag = if flags.contains(&c.idx) { " [flagged]" } else { "" };
             md.push_str(&format!("## Claim{flag}\n\n> {}\n\n", c.claim));
             md.push_str(&format!("**Cited:** {}\n\n", c.citation));
             match tier_a.get(&c.citation) {
@@ -1114,7 +1109,7 @@ fn App() -> impl IntoView {
                     title="Settings — model, gateway, API key, shared vector DB"
                     on:click=move |_| show_settings.update(|s| *s = !*s)
                 >
-                    "⚙"
+                    {icon("gear")}
                 </button>
             </header>
 
@@ -1409,9 +1404,9 @@ fn App() -> impl IntoView {
             // Manuscript audit: import → review claims → run → per-claim results.
             {move || (mode.get() == "audit").then(|| view! {
                 <div class="auditbar">
-                    <button class="draft-upload" title="Import a .docx (Zotero citations) or .tex + .bib manuscript"
+                    <button class="draft-upload ic-btn" title="Import a .docx (Zotero citations) or .tex + .bib manuscript"
                         prop:disabled=move || audit_running.get()
-                        on:click=move |_| import_manuscript()>"📄 Import manuscript (.docx / .tex)"</button>
+                        on:click=move |_| import_manuscript()>{icon("file")}"Import manuscript"</button>
                     {move || (!audit_claims.get().is_empty()).then(|| view! {
                         <button class="draft-go" prop:disabled=move || audit_running.get()
                             on:click=move |_| run_audit_now()>
@@ -1419,31 +1414,14 @@ fn App() -> impl IntoView {
                                 format!("Checking {}/{}…", audit_done.get(), audit_total.get())
                             } else { "Run audit".to_string() }}
                         </button>
-                        <button class="mode" title="Save the audit as a Markdown report"
-                            on:click=move |_| export_report()>"⬇ Export"</button>
+                        <button class="mode ic-btn" title="Save the audit as a Markdown report"
+                            on:click=move |_| export_report()>{icon("download")}"Export"</button>
                     })}
                 </div>
                 {move || (!audit_msg.get().is_empty())
                     .then(|| view! { <div class="notice">{audit_msg.get()}</div> })}
 
-                // Add-a-missed-claim row.
-                {move || (!audit_claims.get().is_empty()).then(|| view! {
-                    <div class="audit-add">
-                        <input class="ask" type="text" placeholder="Add a claim the parser missed…"
-                            prop:value=move || new_claim.get()
-                            on:input=move |ev| new_claim.set(event_target_value(&ev)) />
-                        <select class="source-select"
-                            on:change=move |ev| new_claim_key.set(event_target_value(&ev))>
-                            <option value="">"Cites which paper?"</option>
-                            {move || papers.get().into_iter().map(|p| view! {
-                                <option value=p.key>{p.citation}</option>
-                            }).collect::<Vec<_>>()}
-                        </select>
-                        <button class="mode" on:click=move |_| add_claim()>"＋ Add"</button>
-                    </div>
-                })}
-
-                // Claim rows: text + cited paper + Tier A + Tier B verdict + flag.
+                // Claim rows: verdict + cited paper + reference check + flag/remove.
                 <div class="audit-list">
                     {move || {
                         let results = audit_results.get();
@@ -1452,56 +1430,63 @@ fn App() -> impl IntoView {
                         audit_claims.get().into_iter().map(|c| {
                             let idx = c.idx;
                             let flagged = flags.contains(&idx);
-                            // Tier B verdict cell.
-                            let (vcls, vlabel, detail, passages) = if !c.has_pdf {
-                                ("av nopdf", "No PDF".to_string(), String::new(), Vec::new())
+                            // Verdict: (card border, pill class, icon, label, detail, passages)
+                            let (border, pill, ic, label, detail, passages) = if !c.has_pdf {
+                                ("v-nopdf", "vd vd-nopdf", "file", "No PDF".to_string(), String::new(), Vec::new())
                             } else if let Some(r) = results.get(&idx) {
-                                let cls = match r.verdict.as_str() {
-                                    "SUPPORTED" => "av ok",
-                                    "PARTIALLY SUPPORTED" => "av par",
-                                    "NOT SUPPORTED" => "av no",
-                                    _ => "av ins",
+                                let (b, p, i, l) = match r.verdict.as_str() {
+                                    "SUPPORTED" => ("v-ok", "vd vd-ok", "check", "Supported"),
+                                    "PARTIALLY SUPPORTED" => ("v-par", "vd vd-par", "alert", "Partial"),
+                                    "NOT SUPPORTED" => ("v-no", "vd vd-no", "x", "Not supported"),
+                                    _ => ("v-ins", "vd vd-ins", "minus", "Insufficient"),
                                 };
-                                (cls, r.verdict.clone(), r.detail.clone(), r.passages.clone())
+                                (b, p, i, l.to_string(), r.detail.clone(), r.passages.clone())
                             } else if audit_running.get() {
-                                ("av wait", "…".to_string(), String::new(), Vec::new())
+                                ("v-wait", "vd vd-wait", "", "Checking…".to_string(), String::new(), Vec::new())
                             } else {
-                                ("av idle", "—".to_string(), String::new(), Vec::new())
+                                ("v-idle", "vd vd-idle", "minus", "Not checked".to_string(), String::new(), Vec::new())
                             };
-                            // Tier A badge.
+                            let pill_view = if ic.is_empty() {
+                                view! { <span class=pill><span class="vd-spin"></span>{label}</span> }.into_any()
+                            } else {
+                                view! { <span class=pill>{icon(ic)}{label}</span> }.into_any()
+                            };
+                            // Reference check (Tier A) badge.
                             let tier_a_badge = match tier_a.get(&c.citation) {
                                 Some(r) if r.found && r.confidence >= 55 =>
-                                    view! { <span class="ta ok" title="Real paper (CrossRef)">"ref ✓"</span> }.into_any(),
+                                    view! { <span class="ta ta-ok" title="Cited paper found in CrossRef">{icon("check")}"reference"</span> }.into_any(),
                                 Some(r) if r.found =>
-                                    view! { <span class="ta warn" title="Weak CrossRef match">{format!("ref ? {}%", r.confidence)}</span> }.into_any(),
+                                    view! { <span class="ta ta-warn" title="Weak CrossRef match — verify">{icon("alert")}{format!("reference {}%", r.confidence)}</span> }.into_any(),
                                 Some(_) =>
-                                    view! { <span class="ta bad" title="No CrossRef match — may be fabricated">"ref ✗"</span> }.into_any(),
+                                    view! { <span class="ta ta-bad" title="No CrossRef match — may be fabricated">{icon("x")}"reference"</span> }.into_any(),
                                 None => view! { <span></span> }.into_any(),
                             };
                             view! {
-                                <div class="audit-item">
+                                <div class=format!("audit-item {border}")>
                                     <div class="ai-head">
-                                        <span class=vcls>{vlabel}</span>
+                                        {pill_view}
                                         {tier_a_badge}
-                                        <button class="ai-flag" class:on=flagged
-                                            title="Flag this verdict as wrong / to revisit"
-                                            on:click=move |_| audit_flags.update(|s| {
-                                                if !s.insert(idx) { s.remove(&idx); }
-                                            })>"🚩"</button>
-                                        <button class="ai-del" title="Remove this claim"
-                                            on:click=move |_| remove_claim(idx)>"✕"</button>
+                                        <div class="ai-actions">
+                                            <button class="ai-icon" class:on=flagged
+                                                title="Flag this verdict to revisit"
+                                                on:click=move |_| audit_flags.update(|s| {
+                                                    if !s.insert(idx) { s.remove(&idx); }
+                                                })>{icon("flag")}</button>
+                                            <button class="ai-icon" title="Remove this claim"
+                                                on:click=move |_| remove_claim(idx)>{icon("x")}</button>
+                                        </div>
                                     </div>
                                     <div class="ai-claim">{c.claim.clone()}</div>
-                                    <div class="ai-cite">{c.citation.clone()}</div>
+                                    <div class="ai-cite">"Cited: "{c.citation.clone()}</div>
                                     {(!c.has_pdf).then(|| view! {
-                                        <div class="ai-nopdf">"No PDF in Zotero — reference-checked only, claim support not verified."</div>
+                                        <div class="ai-nopdf">"No PDF in Zotero — reference-checked only; claim support not verified."</div>
                                     })}
                                     {(!detail.is_empty()).then(|| view! { <div class="ai-detail">{detail.clone()}</div> })}
                                     {(!passages.is_empty()).then(|| view! {
                                         <div class="ai-passages">
                                             {passages.into_iter().map(|p| {
                                                 let pg = if p.page.is_empty() { String::new() } else { format!(" (p. {})", p.page) };
-                                                view! { <div class="ai-passage">{format!("“{}”{}", p.snippet, pg)}</div> }
+                                                view! { <div class="ai-passage">{format!("\u{201C}{}\u{201D}{}", p.snippet, pg)}</div> }
                                             }).collect::<Vec<_>>()}
                                         </div>
                                     })}
@@ -1585,8 +1570,8 @@ fn App() -> impl IntoView {
                 } else {
                     view! { <div class="fb">
                         <span class="fb-q">"Was this helpful?"</span>
-                        <button class="fb-btn" title="Helpful" on:click=move |_| rate("up".to_string())>"👍"</button>
-                        <button class="fb-btn" title="Not helpful" on:click=move |_| rate("down".to_string())>"👎"</button>
+                        <button class="fb-btn" title="Helpful" on:click=move |_| rate("up".to_string())>{icon("thumbup")}</button>
+                        <button class="fb-btn" title="Not helpful" on:click=move |_| rate("down".to_string())>{icon("thumbdown")}</button>
                         <a class="fb-link" href="#" title="Open a GitHub issue"
                             on:click=move |ev: web_sys::MouseEvent| {
                                 ev.prevent_default();
